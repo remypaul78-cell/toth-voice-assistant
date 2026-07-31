@@ -1,0 +1,242 @@
+  File "/home/pi/toth/toth_chatbot.py", line 1287
+    CALL_TIMEOUT = 90  # 90 secondes max
+    ^^^^^^^^^^^^
+SyntaxError: expected 'except' or 'finally' block
+[TOTH] T_T len=46 OK=True
+[TOTH] T_C=5754223758
+[TOTH] O_K len=57 OK=True
+[TOTH] Hermes API: http://100.99.52.89:8080
+[TOTH] Initializing WhisplayBoard...
+Traceback (most recent call last):
+  File "/home/pi/toth/toth_chatbot.py", line 1779, in <module>
+    TothChatbot().run()
+    ~~~~~~~~~~~^^
+  File "/home/pi/toth/toth_chatbot.py", line 902, in __init__
+    self.board = WhisplayBoard()
+                 ~~~~~~~~~~~~~^^
+  File "/home/pi/whisplay/runtime/whisplay.py", line 283, in __init__
+    self._init_gpio()
+    ~~~~~~~~~~~~~~~^^
+  File "/home/pi/whisplay/runtime/whisplay.py", line 350, in _init_gpio
+    req = chip.request_lines(consumer='whisplay', config=all_configs)
+  File "/usr/lib/python3/dist-packages/gpiod/chip.py", line 316, in request_lines
+    req_internal = self._chip.request_lines(line_cfg, consumer, event_buffer_size)
+OSError: [Errno 16] Device or resource busy
+[TOTH] T_T len=46 OK=True
+[TOTH] T_C=5754223758
+[TOTH] O_K len=57 OK=True
+[TOTH] Hermes API: http://100.99.52.89:8080
+[TOTH] Initializing WhisplayBoard...
+Traceback (most recent call last):
+  File "/home/pi/toth/toth_chatbot.py", line 1779, in <module>
+    TothChatbot().run()
+    ~~~~~~~~~~~^^
+  File "/home/pi/toth/toth_chatbot.py", line 902, in __init__
+    self.board = WhisplayBoard()
+                 ~~~~~~~~~~~~~^^
+  File "/home/pi/whisplay/runtime/whisplay.py", line 283, in __init__
+    self._init_gpio()
+    ~~~~~~~~~~~~~~~^^
+  File "/home/pi/whisplay/runtime/whisplay.py", line 350, in _init_gpio
+    req = chip.request_lines(consumer='whisplay', config=all_configs)
+  File "/usr/lib/python3/dist-packages/gpiod/chip.py", line 316, in request_lines
+    req_internal = self._chip.request_lines(line_cfg, consumer, event_buffer_size)
+OSError: [Errno 16] Device or resource busy
+[TOTH] T_T len=46 OK=True
+[TOTH] T_C=5754223758
+[TOTH] O_K len=57 OK=True
+[TOTH] Hermes API: http://100.99.52.89:8080
+[TOTH] Initializing WhisplayBoard...
+Detected hardware: Raspberry Pi Zero 2 W Rev 1.0, Backlight mode: PWM
+wm8960 sound card detected.
+[FACE] Started
+[OVERRIDE] Displaying: MOTUS
+[RING] No JX-05 device found — watcher disabled[TOTH] Ready. Hermes direct mode.
+
+[TOTH] Started (Hermes direct mode).
+[BTN] ⬇️  PRESS at 1780952013.5
+[BTN] ⬆️  RELEASE at 1780952013.7
+[BTN] Press detected, state=idle
+[REC] Starting recording...
+[STREAM] Chunk 64000 bytes, RMS=9946 — transcribing...
+[STREAM] Groq result: Et moi de mon côté j'appuie sur le bouton
+[STREAM] Chunk 64000 bytes, RMS=10864 — transcribing...
+[STREAM] Groq result: le bouton et puis je parle comme un
+[STREAM] Chunk 64000 bytes, RMS=10292 — transcribing...
+[STREAM] Groq result: On verra bien si ça marche
+[STREAM] Chunk 64000 bytes, RMS=9433 — transcribing...
+[STREAM] Groq result: fondre ira bien si ça marche pas mais si
+[STREAM] Chunk 64000 bytes, RMS=9582 — transcribing...
+[STREAM] Groq result: ça marche pas, il va falloir qu'on continue
+[STREAM] Chunk 64000 bytes, RMS=6529 — transcribing...
+[STREAM] Groq result: ...
+[STREAM] Chunk 64000 bytes, RMS=5585 — transcribing...
+[STREAM] Groq result: des trous du cul
+[STREAM] Chunk RMS=297 < 1500 — skipped
+[BTN] ⬇️  PRESS at 1780952030.7
+[BTN] ⬆️  RELEASE at 1780952030.8
+[BTN] Press detected, state=record
+[PROC] Stopping recording...
+[API] POST http://100.99.52.89:8080/v1/chat/completions (5-msg context, session=NONE, timeout=90s)...
+[API] Got response in 7.0s (358 chars)
+[TTS] Speaking 5 sentences → 2 batch(es): 🏴‍☠️ Amiral, ta voix arrive clairement jusqu'à moi — la chaîne Toth → Whisper → ...
+[TTS] Device: PulseAudio (AirPods)
+[DISP-SCROLL] batch=0/2, duration=13.9s, text_len=358
+[SCROLL] lines=15, total_h=406, scroll=146px, anim=1.5s, fps=12, step=8.3px
+[SCROLL] Frame error: [Errno 1] Operation not permitted
+[DISP-SCROLL] batch=1/2, duration=9.2s, text_len=358
+[SCROLL] lines=11, total_h=302, scroll=42px, anim=0.4s, fps=12, step=8.3px
+[BTN] ⬇️  PRESS at 1780952065.8
+[BTN] ⬆️  RELEASE at 1780952065.9
+[BTN] Press detected, state=waiting
+[BTN] 🔴 CANCEL pressed during state=waiting — killing everything
+[IDLE] Returning to idle...
+[FACE] Started
+[TTS] All sentences played
+[IDLE] Returning to idle...
+[FACE] Started
+[BTN] ⬇️  PRESS at 1780952084.2
+[BTN] ⬆️  RELEASE at 1780952084.4
+[BTN] Press detected, state=idle
+[REC] Starting recording...
+[STREAM] Chunk 64000 bytes, RMS=3832 — transcribing...
+[STREAM] Groq result: Ok, t'es un grand capote
+[STREAM] Chunk 64000 bytes, RMS=3888 — transcribing...
+[STREAM] Groq result: bat-il Capitaine,
+[DISP] [Errno 1] Operation not permitted
+[STREAM] Chunk 64000 bytes, RMS=3408 — transcribing...
+[STREAM] Groq result: de ma flotte principale
+[STREAM] Chunk 64000 bytes, RMS=4837 — transcribing...
+[STREAM] Groq result: de ne pas dire le nombre...
+[STREAM] Chunk 64000 bytes, RMS=4555 — transcribing...
+[STREAM] Groq result: de flotte que j'ai entièrement...
+[STREAM] Chunk 64000 bytes, RMS=7849 — transcribing...
+[STREAM] Groq result: Mais franchement, t'es classé dans...
+[STREAM] Chunk 64000 bytes, RMS=4565 — transcribing...
+[STREAM] Groq result: On est les meilleurs capitaines, non ?
+[BTN] ⬇️  PRESS at 1780952105.0
+[BTN] ⬆️  RELEASE at 1780952105.2
+[BTN] Press detected, state=record
+[PROC] Stopping recording...
+[API] POST http://100.99.52.89:8080/v1/chat/completions (5-msg context, session=NONE, timeout=90s)...
+[API] Got response in 4.5s (201 chars)
+[TTS] Speaking 3 sentences → 1 batch(es): 🏴‍☠️ Amiral, c'est un honneur d'être ton capitaine de vaisseau amiral. Le DEEPSE...
+[TTS] Device: PulseAudio (AirPods)
+[DISP-SCROLL] batch=0/1, duration=13.5s, text_len=201
+[SCROLL] lines=13, total_h=354, scroll=94px, anim=0.9s, fps=12, step=8.3px
+[SCROLL] Frame error: [Errno 1] Operation not permitted
+[TTS] All sentences played
+[IDLE] Returning to idle...
+[FACE] Started
+[BTN] ⬇️  PRESS at 1780952136.4
+[BTN] ⬆️  RELEASE at 1780952136.6
+[BTN] Press detected, state=idle
+[REC] Starting recording...
+[STREAM] Chunk 64000 bytes, RMS=4017 — transcribing...
+[STREAM] Groq result: Journal de bord.
+[STREAM] Chunk 64000 bytes, RMS=2319 — transcribing...
+[STREAM] Groq result: triple synchronisation
+[STREAM] Chunk 64000 bytes, RMS=4159 — transcribing...
+[STREAM] Groq result: figeages dans le
+[STREAM] Chunk 64000 bytes, RMS=4007 — transcribing...
+[STREAM] Groq result: marbre de toutes ces opérations
+[STREAM] Chunk 64000 bytes, RMS=2830 — transcribing...
+[STREAM] Groq result: opération
+[BTN] ⬇️  PRESS at 1780952148.9
+[STREAM] Chunk RMS=247 < 1500 — skipped
+[BTN] ⬆️  RELEASE at 1780952149.1
+[BTN] Press detected, state=record
+[PROC] Stopping recording...
+[API] POST http://100.99.52.89:8080/v1/chat/completions (5-msg context, session=NONE, timeout=90s)...
+[API] Failed: timed out
+[ASK] No answer — going idle silently
+[IDLE] Returning to idle...
+[FACE] Started
+[TOTH] T_T len=46 OK=True
+[TOTH] T_C=5754223758
+[TOTH] O_K len=57 OK=True
+[TOTH] Hermes API: http://49.13.237.85:8080
+[TOTH] Initializing WhisplayBoard...
+Detected hardware: Raspberry Pi Zero 2 W Rev 1.0, Backlight mode: PWM
+wm8960 sound card detected.
+[FACE] Started
+[OVERRIDE] Displaying: MOTUS
+[RING] No JX-05 device found — watcher disabled[TOTH] Ready. Hermes direct mode.
+
+[TOTH] Started (Hermes direct mode).
+[BTN] ⬇️  PRESS at 1780953633.5
+[BTN] ⬆️  RELEASE at 1780953633.6
+[TOTH] T_T len=46 OK=True
+[TOTH] T_C=5754223758
+[TOTH] O_K len=57 OK=True
+[TOTH] Hermes API: http://49.13.237.85:8080
+[TOTH] Initializing WhisplayBoard...
+Detected hardware: Raspberry Pi Zero 2 W Rev 1.0, Backlight mode: PWM
+wm8960 sound card detected.
+[FACE] Started
+[OVERRIDE] Displaying: MOTUS[RING] No JX-05 device found — watcher disabled
+[TOTH] Ready. Hermes direct mode.
+
+[TOTH] Started (Hermes direct mode).
+[BTN] ⬇️  PRESS at 1780954590.3
+[BTN] ⬆️  RELEASE at 1780954590.5
+[BTN] Press detected, state=idle
+[REC] Starting recording...
+[STREAM] Chunk 64000 bytes, RMS=5634 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb2415d30>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk 64000 bytes, RMS=3713 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb2449e50>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk 64000 bytes, RMS=4763 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb244a850>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk 64000 bytes, RMS=4300 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb244ac10>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk 64000 bytes, RMS=7878 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb244afd0>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk RMS=348 < 1500 — skipped
+[STREAM] Chunk RMS=442 < 1500 — skipped
+[BTN] ⬇️  PRESS at 1780954606.5
+[BTN] ⬆️  RELEASE at 1780954606.7
+[BTN] Press detected, state=record
+[PROC] Stopping recording...
+[IDLE] Returning to idle...
+[FACE] Started
+[BTN] ⬇️  PRESS at 1780954610.1
+[BTN] ⬆️  RELEASE at 1780954610.3
+[BTN] Press detected, state=idle
+[REC] Starting recording...
+[STREAM] Chunk RMS=840 < 1500 — skipped
+[STREAM] Chunk 64000 bytes, RMS=7451 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb237de50>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk 64000 bytes, RMS=6533 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb244b110>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk 64000 bytes, RMS=1768 — transcribing...
+[GROQ] Chunk error: HTTPSConnectionPool(host='api.groq.com', port=443): Max retries exceeded with url: /openai/v1/audio/transcriptions (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x7fb244ad50>: Failed to resolve 'api.groq.com' ([Errno -3] Temporary failure in name resolution)"))
+[STREAM] Chunk RMS=803 < 1500 — skipped
+[STREAM] Chunk RMS=1219 < 1500 — skipped
+[STREAM] Chunk RMS=1069 < 1500 — skipped
+[STREAM] Chunk RMS=839 < 1500 — skipped
+[STREAM] Chunk RMS=1228 < 1500 — skipped
+[STREAM] Chunk RMS=812 < 1500 — skipped
+[STREAM] Chunk RMS=1318 < 1500 — skipped
+[STREAM] Chunk RMS=1138 < 1500 — skipped
+[STREAM] Chunk RMS=514 < 1500 — skipped
+[STREAM] Chunk RMS=389 < 1500 — skipped
+[STREAM] Chunk RMS=371 < 1500 — skipped
+[STREAM] Chunk RMS=248 < 1500 — skipped
+[STREAM] Chunk RMS=417 < 1500 — skipped
+[STREAM] Chunk RMS=294 < 1500 — skipped
+[STREAM] Chunk RMS=262 < 1500 — skipped
+[STREAM] Chunk RMS=399 < 1500 — skipped
+[STREAM] Chunk RMS=317 < 1500 — skipped
+[STREAM] Chunk RMS=469 < 1500 — skipped
+[STREAM] Chunk RMS=447 < 1500 — skipped
+[STREAM] Chunk RMS=418 < 1500 — skipped
+[STREAM] Chunk RMS=379 < 1500 — skipped
+[STREAM] Chunk RMS=362 < 1500 — skipped
+[STREAM] Chunk RMS=247 < 1500 — skipped
+[STREAM] Chunk RMS=288 < 1500 — skipped
+[STREAM] Chunk RMS=189 < 1500 — skipped
+[REC] ⏰ Timeout sécurité 60s atteint — arrêt auto
+[PROC] Stopping recording...
+[IDLE] Returning to idle...
+[FACE] Started

@@ -1,0 +1,9 @@
+=== CONTEXTE TOTH — 8 juin 04:10 ===
+- Hermes VPS : v3.2 (principal) + délégation qwen3:14b local remy-kubun (gratuit)
+- Toth : v4-pro (hermes_oneshot.py)
+- Badges [v3.2] / [v4] en fin de chaque réponse
+- Commandes vocales : "appelle v4" ou "appelle v3.2" → bascule immédiate
+- Bague JX-05 connectée et calibrée
+- Token Telegram : 8042301467 (Hermes)
+- Journal de bord synchronisé
+- Ne jamais changer modèle sans ordre de Rémy

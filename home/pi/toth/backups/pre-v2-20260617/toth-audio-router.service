@@ -1,0 +1,16 @@
+[Unit]
+Description=Toth audio router — BT or internal speaker
+After=pulseaudio.service bluetooth.service raspotify.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+Environment="PULSE_RUNTIME_PATH=/run/user/1000/pulse"
+ExecStart=/usr/local/bin/toth_audio_router_loop.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Spotify UI clone for Toth — faithful visual copy of the Spotify mobile app.
+240x280 Whisplay LCD. Rémy — 17 juin 2026.
+"""
+import os, json, time, threading, urllib.request
+from PIL import Image, ImageDraw, ImageFont
+
+BLACK   = "#000000"
+DARK    = "#191414"
+GRAY    = "#B3B3B3"
+DARKGRAY= "#535353"
+GREEN   = "#1DB954"
+WHITE   = "#FFFFFF"
+
+class SpotifyTothUI:
+    def __init__(self, board, display_lock, pil_to_rgb565=None):
+        self.board = board
+        self._display_lock = display_lock
+        self._pil_to_rgb565 = pil_to_rgb565 or self._default_rgb565
+        self.W, self.H = 240, 280
+        self._load_fonts()
+        self._lock = threading.Lock()
+
+        # State
+        self.inside = False
+        self.tab_idx = 0
+        self.zik_sel = 0            # 0=Rechercher,1=Playlists,2=Récemment,3=Lecture
+        self.show_results = False
+        self.show_playlists = False
+        self.show_recent = False
+        self.result_idx = 0
+        self.playlist_idx = 0
+        self.recent_idx = 0
+        self.results = []
+        self.playlists = []
+        self.recent = []
+        self.control_idx = 1        # play/pause selected
+        self.now_playing = {"name":"Rien en lecture","artist":"","is_playing":False,"progress":0,"duration":0,"img":None}
+        self._callbacks = {}
+
+    def _load_fonts(self):
+        bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        norm = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        if not os.path.exists(bold):
+            self.fb = self.fm = self.fs = self.fx = ImageFont.load_default()
+            return
+        self.fb = ImageFont.truetype(bold, 22)
+        self.fm = ImageFont.truetype(norm, 17)
+        self.fs = ImageFont.truetype(norm, 15)
+        self.fx = ImageFont.truetype(norm, 12)
+
+    def _default_rgb565(self, img):
+        import numpy as np
+        arr = np.array(img.convert("RGB"), dtype=np.uint32)
+        r = (arr[:,:,0] >> 3) & 0x1F
+        g = (arr[:,:,1] >> 2) & 0x3F
+        b = (arr[:,:,2] >> 3) & 0x1F
+        return ((r << 11) | (g << 5) | b).astype(np.uint16).tobytes()
+
+    # ---- callbacks / setters ----
+    def set_callback(self, name, fn):
+        self._callbacks[name] = fn
+
+    def set_results(self, results):
+        with self._lock:
+            self.results = results or []
+            self.result_idx = 0
+            self.show_results = bool(self.results)
+            self.zik_sel = -1
+
+    def set_playlists(self, playlists):
+        with self._lock:
+            self.playlists = playlists or []
+            self.playlist_idx = 0
+            self.show_playlists = bool(self.playlists)
+            self.zik_sel = -1
+
+    def set_recent(self, recent):
+        with self._lock:
+            self.recent = recent or []
+            self.recent_idx = 0
+            self.show_recent = bool(self.recent)
+            self.zik_sel = -1
+
+    def set_now_playing(self, name, artist, is_playing=False, progress=0, duration=0, img=None):
+        with self._lock:
+            self.now_playing = {"name":name or "?","artist":artist or "","is_playing":is_playing,"progress":progress,"duration":duration,"img":img}
+
+    def is_active(self):
+        return self.inside
+
+    # ---- navigation ----
+    def action(self, action):
+        with self._lock:
+            if action == "record":
+                # selection / play
+                if self.show_results:
+                    res = self.results[self.result_idx % len(self.results)] if self.results else None
+                    if res:
+                        cb = self._callbacks.get("play")
+                        if cb:
+                            self._exit_lists(); self.zik_sel = 3; self.control_idx = 1
+                            threading.Thread(target=cb, args=(res,), daemon=True).start()
+                elif self.show_playlists:
+                    pl = self.playlists[self.playlist_idx % len(self.playlists)] if self.playlists else None
+                    if pl:
+                        cb = self._callbacks.get("play")
+                        if cb:
+                            self._exit_lists(); self.zik_sel = 3; self.control_idx = 1
+                            threading.Thread(target=cb, args=({"name":pl.get("name","?"),"artist":"","type":"playlist","uri":pl.get("uri","")},), daemon=True).start()
+                elif self.show_recent:
+                    rec = self.recent[self.recent_idx % len(self.recent)] if self.recent else None
+                    if rec:
+                        cb = self._callbacks.get("play")
+                        if cb:
+                            self._exit_lists(); self.zik_sel = 3; self.control_idx = 1
+                            threading.Thread(target=cb, args=(rec,), daemon=True).start()
+                elif self.zik_sel == 0:
+                    cb = self._callbacks.get("search")
+                    if cb:
+                        threading.Thread(target=cb, daemon=True).start()
+                elif self.zik_sel == 1:
+                    self.show_playlists = True
+                    cb = self._callbacks.get("playlists")
+                    if cb:
+                        threading.Thread(target=cb, daemon=True).start()
+                elif self.zik_sel == 2:
+                    self.show_recent = True
+                    cb = self._callbacks.get("recent")
+                    if cb:
+                        threading.Thread(target=cb, daemon=True).start()
+                elif self.zik_sel == 3:
+                    self._activate_control()
+
+            elif action in ("haut","bas"):
+                # HAUT/BAS suivent l'ordre visuel (haut = -, bas = +)
+                delta = -1 if action == "haut" else 1
+                if self.show_results:
+                    n = len(self.results)
+                    if n:
+                        self.result_idx = (self.result_idx + delta) % n
+                elif self.show_playlists:
+                    n = len(self.playlists)
+                    if n:
+                        self.playlist_idx = (self.playlist_idx + delta) % n
+                elif self.show_recent:
+                    n = len(self.recent)
+                    if n:
+                        self.recent_idx = (self.recent_idx + delta) % n
+                elif self.zik_sel == 3:
+                    self.control_idx = (self.control_idx + delta) % 3
+                elif self.zik_sel >= 0:
+                    self.zik_sel = (self.zik_sel + delta) % 4
+
+            elif action in ("gauche","droite"):
+                # back / exit
+                if self.show_results or self.show_playlists or self.show_recent:
+                    self._exit_lists()
+                    self.zik_sel = 0
+                elif self.zik_sel == 3:
+                    self.zik_sel = 0
+                # else: let toth_chatbot handle exit from ZIK tab
+
+        self.draw()
+
+    def _exit_lists(self):
+        self.show_results = False
+        self.show_playlists = False
+        self.show_recent = False
+
+    def _activate_control(self):
+        btns = ["previous","play_pause","next"]
+        btn = btns[self.control_idx % 3]
+        cb = self._callbacks.get("control")
+        if cb:
+            threading.Thread(target=cb, args=(btn,), daemon=True).start()
+
+    # ---- helpers ----
+    def _center(self, draw, text, font, y, fill, max_w=None):
+        bbox = draw.textbbox((0,0), text, font=font)
+        w = bbox[2]-bbox[0]
+        if max_w and w > max_w:
+            while w > max_w and len(text) > 3:
+                text = text[:-1]
+                bbox = draw.textbbox((0,0), text+"…", font=font)
+                w = bbox[2]-bbox[0]
+            text = text + "…"
+            bbox = draw.textbbox((0,0), text, font=font)
+            w = bbox[2]-bbox[0]
+        draw.text(((self.W-w)//2, y), text, font=font, fill=fill)
+
+    def _fmt_time(self, s):
+        s = int(s)
+        return f"{s//60}:{s%60:02d}"
+
+    # ---- drawing ----
+    def draw(self):
+        with self._lock:
+            img = Image.new("RGB", (self.W, self.H), BLACK)
+            draw = ImageDraw.Draw(img)
+            if not self.inside:
+                self._draw_mini_icon(draw)
+            elif self.show_results:
+                self._draw_list(draw, self.results, self.result_idx, "Résultats")
+            elif self.show_playlists:
+                self._draw_list(draw, self.playlists, self.playlist_idx, "Playlists")
+            elif self.show_recent:
+                self._draw_list(draw, self.recent, self.recent_idx, "Récemment joué")
+            elif self.zik_sel == 3:
+                self._draw_player(draw)
+            else:
+                self._draw_menu(draw)
+            data = self._pil_to_rgb565(img)
+        try:
+            with self._display_lock:
+                self.board.draw_image(0,0,self.W,self.H,data)
+        except Exception as e:
+            print(f"[SPOTIFY UI DRAW] {e}")
+
+    def _draw_mini_icon(self, draw):
+        self._center(draw, "Spotify", self.fb, 12, GREEN)
+        cx, cy = self.W//2, 140
+        r = 50
+        draw.ellipse([cx-r,cy-r,cx+r,cy+r], fill=GREEN)
+        draw.text((cx-9,cy-13), "♪", font=self.fb, fill=BLACK)
+
+    def _draw_menu(self, draw):
+        self._center(draw, "Spotify", self.fb, 8, GREEN)
+        opts = [
+            ("Rechercher", "🔍"),
+            ("Mes playlists", "📂"),
+            ("Récemment joué", "🕐"),
+            ("Lecture en cours", "▶"),
+        ]
+        y0, gap = 52, 52
+        for i, (label, icon) in enumerate(opts):
+            y = y0 + i*gap
+            selected = (i == self.zik_sel)
+            if selected:
+                draw.rectangle([0,y-2,6,y+30], fill=GREEN)
+            color = WHITE if selected else GRAY
+            font = self.fm if selected else self.fs
+            draw.text((16,y), icon, font=self.fm, fill=GREEN if selected else DARKGRAY)
+            draw.text((46,y), label, font=font, fill=color)
+
+    def _draw_list(self, draw, items, idx, title):
+        self._center(draw, title, self.fm, 8, WHITE, max_w=220)
+        if not items:
+            self._center(draw, "Aucun résultat", self.fs, 130, GRAY)
+            return
+        MAX_VIS = 5
+        total = len(items)
+        cur = idx % total
+        if total <= MAX_VIS:
+            start = 0
+        else:
+            start = max(0, min(cur - MAX_VIS//2, total - MAX_VIS))
+        y0, gap = 46, 44
+        for j in range(MAX_VIS):
+            i = start + j
+            if i >= total:
+                break
+            y = y0 + j*gap
+            selected = (i == cur)
+            it = items[i]
+            name = str(it.get("name","?"))[:24]
+            artist = str(it.get("artist",""))[:28]
+            if selected:
+                draw.ellipse([8,y+6,16,y+14], fill=GREEN)
+            else:
+                draw.ellipse([8,y+6,16,y+14], fill=DARKGRAY)
+            draw.text((24,y), name, font=self.fs, fill=WHITE if selected else GRAY)
+            if artist:
+                draw.text((24,y+17), artist, font=self.fx, fill=DARKGRAY)
+        self._center(draw, "Milieu = jouer  │  Gauche = retour", self.fx, 262, DARKGRAY)
+
+    def _draw_player(self, draw):
+        np = self.now_playing
+        # Cover square placeholder
+        size = 150
+        x0 = (self.W - size)//2
+        y0 = 12
+        radius = 12
+        img_cover = np.get("img")
+        if img_cover:
+            try:
+                cover = Image.open(img_cover).convert("RGB").resize((size,size))
+                # rounded mask
+                mask = Image.new("L", (size,size), 0)
+                ImageDraw.Draw(mask).rounded_rectangle([0,0,size-1,size-1], radius=radius, fill=255)
+                bg = Image.new("RGB", (size,size), DARKGRAY)
+                bg.paste(cover, (0,0), mask)
+                img.paste(bg, (x0,y0))
+            except Exception:
+                img_cover = None
+        if not img_cover:
+            draw.rounded_rectangle([x0,y0,x0+size,y0+size], radius=radius, fill=DARKGRAY)
+            draw.text((x0+58,y0+58), "♪", font=self.fb, fill=GRAY)
+        # Title / artist
+        self._center(draw, np.get("name","?"), self.fm, 176, WHITE, max_w=220)
+        if np.get("artist"):
+            self._center(draw, np.get("artist",""), self.fs, 202, GRAY, max_w=220)
+        # Progress
+        self._draw_progress(draw, np.get("progress",0), np.get("duration",0), y=230)
+        # Controls
+        self._draw_controls(draw, y=248)
+
+    def _draw_progress(self, draw, progress, duration, y):
+        bar_w = 200
+        x0 = (self.W - bar_w)//2
+        draw.rounded_rectangle([x0,y,x0+bar_w,y+6], radius=3, fill=DARKGRAY)
+        ratio = min(1.0, progress/duration) if duration else 0.0
+        fill_w = int(bar_w * ratio)
+        cx = x0 + fill_w
+        if fill_w:
+            draw.rounded_rectangle([x0,y,cx,y+6], radius=3, fill=GREEN)
+        draw.ellipse([cx-5,y-2,cx+5,y+8], fill=GREEN)
+        draw.text((x0,y+12), self._fmt_time(progress), font=self.fx, fill=GRAY)
+        draw.text((x0+bar_w-38,y+12), self._fmt_time(duration), font=self.fx, fill=GRAY)
+
+    def _draw_controls(self, draw, y):
+        np = self.now_playing
+        is_playing = np.get("is_playing", False)
+        labels = ["|◀", "▌▌" if is_playing else "▶", "▶▶"]
+        xs = [52, 120, 188]
+        for i, lab in enumerate(labels):
+            x = xs[i]
+            selected = (i == self.control_idx)
+            r = 23 if selected else 20
+            color = GREEN if selected else DARKGRAY
+            draw.ellipse([x-r,y-r,x+r,y+r], fill=color)
+            fill = BLACK if selected else WHITE
+            font = self.fm if selected else self.fs
+            bbox = draw.textbbox((0,0), lab, font=font)
+            tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+            draw.text((x-tw//2, y-th//2), lab, font=font, fill=fill)
+        self._center(draw, "Haut/Bas = bouton  │  Gauche = retour", self.fx, 275, DARKGRAY)

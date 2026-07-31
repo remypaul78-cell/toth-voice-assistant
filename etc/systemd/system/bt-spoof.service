@@ -1,0 +1,15 @@
+[Unit]
+Description=Spoof Bluetooth MAC to Toth 1 address
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash -c "hciconfig hci0 down; btmgmt --index 0 public-addr B8:27:EB:8E:13:DF; hciconfig hci0 up; bluetoothctl power on; sleep 2; bluetoothctl connect 3F:17:65:76:D4:2A"
+TimeoutStartSec=15
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

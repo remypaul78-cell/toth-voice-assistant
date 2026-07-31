@@ -1,0 +1,10 @@
+# ALSA config — WM8960 (Whisplay) par défaut
+pcm.!default {
+    type hw
+    card 0
+    device 0
+}
+ctl.!default {
+    type hw
+    card 0
+}

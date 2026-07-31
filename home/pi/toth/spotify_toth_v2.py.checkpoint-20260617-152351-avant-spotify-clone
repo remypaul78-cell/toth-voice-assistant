@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""Toth Spotify v2 UI — copie visuelle de l'application Spotify officielle.
+Conçu pour Raspberry Pi Whisplay 240x280, importé par toth_chatbot.py.
+Rémy - 17 juin 2026.
+"""
+import os, json, time, threading, math
+from PIL import Image, ImageDraw, ImageFont
+
+# Palette Spotify
+SPOTIFY_GREEN = "#1DB954"
+SPOTIFY_DARK  = "#191414"
+WHITE   = "#FFFFFF"
+GRAY    = "#B3B3B3"
+DARKGRAY= "#535353"
+BLACK   = "#000000"
+
+class SpotifyTothUI:
+    def __init__(self, board, display_lock, pil_to_rgb565=None):
+        self.board = board
+        self._display_lock = display_lock
+        self._pil_to_rgb565 = pil_to_rgb565 or self._default_rgb565
+        self.W = 240
+        self.H = 280
+        # Fonts (fallback robuste)
+        self._load_fonts()
+        # État
+        self.inside = False
+        self.tab_idx = 0
+        self.zik_sel = 0            # 0=Rechercher, 1=Playlists, 2=Recent, 3=Lecture
+        self.show_results = False
+        self.show_playlists = False
+        self.show_recent = False
+        self.result_idx = 0
+        self.playlist_idx = 0
+        self.recent_idx = 0
+        self.results = []
+        self.playlists = []
+        self.recent = []
+        self.now_playing = {"name": "Rien en lecture", "artist": "", "is_playing": False, "progress": 0, "duration": 0}
+        self.control_idx = 1        # bouton central sélectionné par défaut (Play/Pause)
+        self._callbacks = {}
+        self._cover = None
+        self._cover_data = None
+        self._lock = threading.Lock()
+
+    # ---- Fonts ----
+    def _load_fonts(self):
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        ]
+        def first(size_bold, size_norm):
+            for c in candidates:
+                if os.path.exists(c):
+                    return ImageFont.truetype(c, size_bold), ImageFont.truetype(c, size_norm)
+            return ImageFont.load_default(), ImageFont.load_default()
+        self.fb, self.fm = first(22, 17)
+        self.fs, self.fx = first(14, 12)
+
+    def _default_rgb565(self, img):
+        import numpy as np
+        arr = np.array(img.convert("RGB"), dtype=np.uint32)
+        r = (arr[:,:,0] >> 3) & 0x1F
+        g = (arr[:,:,1] >> 2) & 0x3F
+        b = (arr[:,:,2] >> 3) & 0x1F
+        out = ((r << 11) | (g << 5) | b).astype(np.uint16).tobytes()
+        return out
+
+    # ---- Callbacks / setters ----
+    def set_callback(self, name, fn):
+        self._callbacks[name] = fn
+
+    def set_results(self, results):
+        with self._lock:
+            self.results = results or []
+            self.result_idx = 0
+            self.show_results = bool(self.results)
+            self.zik_sel = -1
+
+    def set_playlists(self, playlists):
+        with self._lock:
+            self.playlists = playlists or []
+            self.playlist_idx = 0
+            self.show_playlists = bool(self.playlists)
+            self.zik_sel = -1
+
+    def set_recent(self, recent):
+        with self._lock:
+            self.recent = recent or []
+            self.recent_idx = 0
+            self.show_recent = bool(self.recent)
+            self.zik_sel = -1
+
+    def set_now_playing(self, name, artist, is_playing, progress=0, duration=0):
+        with self._lock:
+            self.now_playing = {"name": name or "?", "artist": artist or "", "is_playing": is_playing, "progress": progress, "duration": duration}
+
+    def is_active(self):
+        return self.inside
+
+    # ---- Navigation ----
+    def action(self, action):
+        with self._lock:
+            if action == "record":
+                if self.show_results:
+                    res = self.results[self.result_idx % len(self.results)] if self.results else None
+                    if res:
+                        cb = self._callbacks.get("play")
+                        if cb:
+                            self._exit_lists(); self.zik_sel = 3; self.control_idx = 1
+                            threading.Thread(target=cb, args=(res,), daemon=True).start()
+                elif self.show_playlists:
+                    pl = self.playlists[self.playlist_idx % len(self.playlists)] if self.playlists else None
+                    if pl:
+                        cb = self._callbacks.get("play")
+                        if cb:
+                            self._exit_lists(); self.zik_sel = 3; self.control_idx = 1
+                            threading.Thread(target=cb, args=({"name": pl.get("name","?"), "artist": "", "type": "playlist", "uri": pl.get("uri","")},), daemon=True).start()
+                elif self.show_recent:
+                    rec = self.recent[self.recent_idx % len(self.recent)] if self.recent else None
+                    if rec:
+                        cb = self._callbacks.get("play")
+                        if cb:
+                            self._exit_lists(); self.zik_sel = 3; self.control_idx = 1
+                            threading.Thread(target=cb, args=(rec,), daemon=True).start()
+                elif self.zik_sel == 0:
+                    cb = self._callbacks.get("search")
+                    if cb: threading.Thread(target=cb, daemon=True).start()
+                elif self.zik_sel == 1:
+                    self.show_playlists = True
+                    cb = self._callbacks.get("playlists")
+                    if cb: threading.Thread(target=cb, daemon=True).start()
+                elif self.zik_sel == 2:
+                    self.show_recent = True
+                    cb = self._callbacks.get("recent")
+                    if cb: threading.Thread(target=cb, daemon=True).start()
+                elif self.zik_sel == 3:
+                    self._activate_control()
+            elif action in ("haut", "bas"):
+                if self.show_results:
+                    n = len(self.results)
+                    if n:
+                        self.result_idx = (self.result_idx + (1 if action == "bas" else -1)) % n
+                elif self.show_playlists:
+                    n = len(self.playlists)
+                    if n:
+                        self.playlist_idx = (self.playlist_idx + (1 if action == "bas" else -1)) % n
+                elif self.show_recent:
+                    n = len(self.recent)
+                    if n:
+                        self.recent_idx = (self.recent_idx + (1 if action == "bas" else -1)) % n
+                elif self.zik_sel == 3:
+                    # now playing: haut/bas changent de bouton
+                    self.control_idx = (self.control_idx + (1 if action == "bas" else -1)) % 4
+                elif self.zik_sel >= 0:
+                    opts = 4
+                    self.zik_sel = (self.zik_sel + (1 if action == "bas" else -1)) % opts
+            elif action in ("gauche", "droite"):
+                if self.show_results or self.show_playlists or self.show_recent:
+                    self._exit_lists()
+                    self.zik_sel = 0
+                elif self.zik_sel == 3:
+                    # sortir de l'écran lecture vers menu principal
+                    self.zik_sel = 0
+                else:
+                    # quitter ZIK (géré par toth_chatbot)
+                    pass
+        self.draw()
+
+    def _exit_lists(self):
+        self.show_results = False
+        self.show_playlists = False
+        self.show_recent = False
+
+    def _activate_control(self):
+        btns = ["previous", "play_pause", "next", "stop"]
+        btn = btns[self.control_idx % 4]
+        cb = self._callbacks.get("control")
+        if cb:
+            threading.Thread(target=cb, args=(btn,), daemon=True).start()
+        else:
+            # fallback par défaut
+            self._default_control(btn)
+
+    def _default_control(self, btn):
+        try:
+            with open("/root/.hermes/auth.json") as f:
+                token = json.load(f)["providers"]["spotify"]["access_token"]
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            if btn == "previous":
+                req = urllib.request.Request("https://api.spotify.com/v1/me/player/previous", headers=headers, method="POST", data=b"")
+            elif btn == "next":
+                req = urllib.request.Request("https://api.spotify.com/v1/me/player/next", headers=headers, method="POST", data=b"")
+            elif btn == "play_pause":
+                req_state = urllib.request.Request("https://api.spotify.com/v1/me/player", headers=headers)
+                with urllib.request.urlopen(req_state, timeout=10) as r:
+                    pb = json.loads(r.read().decode())
+                endpoint = "pause" if pb.get("is_playing", False) else "play"
+                req = urllib.request.Request(f"https://api.spotify.com/v1/me/player/{endpoint}", headers=headers, method="PUT", data=b"")
+            elif btn == "stop":
+                req = urllib.request.Request("https://api.spotify.com/v1/me/player/pause", headers=headers, method="PUT", data=b"")
+                self.zik_sel = 0
+            else:
+                return
+            with urllib.request.urlopen(req, timeout=10) as r:
+                _ = r.read()
+        except Exception as e:
+            print(f"[SPOTIFY V2 CONTROL] {e}")
+
+    # ---- Drawing ----
+    def draw(self):
+        with self._lock:
+            img = Image.new("RGB", (self.W, self.H), BLACK)
+            draw = ImageDraw.Draw(img)
+            if not self.inside:
+                # Icône/minia depuis l'onglet MEDIA (aperçu)
+                self._draw_mini_icon(draw)
+            elif self.show_results:
+                self._draw_list(draw, self.results, self.result_idx, "Résultats Spotify")
+            elif self.show_playlists:
+                self._draw_list(draw, self.playlists, self.playlist_idx, "Mes playlists")
+            elif self.show_recent:
+                self._draw_list(draw, self.recent, self.recent_idx, "Écoutés récemment")
+            elif self.zik_sel == 3:
+                self._draw_player(draw)
+            else:
+                self._draw_menu(draw)
+            data = self._pil_to_rgb565(img)
+        try:
+            with self._display_lock:
+                self.board.draw_image(0, 0, self.W, self.H, data)
+        except Exception as e:
+            print(f"[SPOTIFY UI DRAW] {e}")
+
+    def _center(self, draw, text, font, y, fill, max_w=None):
+        bbox = draw.textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]
+        x = (self.W - w) // 2
+        if max_w and w > max_w:
+            # tronquer
+            while w > max_w and len(text) > 3:
+                text = text[:-1]
+                bbox = draw.textbbox((0, 0), text + "…", font=font)
+                w = bbox[2] - bbox[0]
+            text = text + "…"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w = bbox[2] - bbox[0]
+            x = (self.W - w) // 2
+        draw.text((x, y), text, font=font, fill=fill)
+
+    def _draw_mini_icon(self, draw):
+        # Petit logo / titre dans l'onglet MEDIA
+        self._center(draw, "Spotify", self.fb, 12, SPOTIFY_GREEN)
+        # cercle vert avec note de musique simplifiée
+        cx, cy = self.W // 2, 140
+        r = 50
+        draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=SPOTIFY_GREEN, outline=SPOTIFY_GREEN)
+        draw.text((cx-8, cy-12), "♪", font=self.fb, fill=BLACK)
+
+    def _draw_menu(self, draw):
+        self._center(draw, "Spotify", self.fb, 12, SPOTIFY_GREEN)
+        opts = [
+            ("Rechercher", "🔍"),
+            ("Mes playlists", "📂"),
+            ("Écoutés récemment", "🕐"),
+            ("Lecture en cours", "▶"),
+        ]
+        y0 = 55
+        gap = 50
+        for i, (label, icon) in enumerate(opts):
+            y = y0 + i * gap
+            selected = (i == self.zik_sel)
+            # Barre verte à gauche si sélectionné
+            if selected:
+                draw.rectangle([0, y-2, 6, y+28], fill=SPOTIFY_GREEN)
+            color = WHITE if selected else GRAY
+            font = self.fm if selected else self.fs
+            draw.text((18, y), icon, font=self.fm, fill=SPOTIFY_GREEN if selected else DARKGRAY)
+            draw.text((48, y), label, font=font, fill=color)
+
+    def _draw_list(self, draw, items, idx, title):
+        self._center(draw, title, self.fm, 12, WHITE, max_w=220)
+        if not items:
+            self._center(draw, "Aucun résultat", self.fs, 130, GRAY)
+            return
+        MAX_VIS = 5
+        total = len(items)
+        cur = idx % total
+        if total <= MAX_VIS:
+            start = 0
+        else:
+            start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+        y0 = 48
+        gap = 42
+        for j in range(MAX_VIS):
+            i = start + j
+            if i >= total:
+                break
+            y = y0 + j * gap
+            selected = (i == cur)
+            item = items[i]
+            name = item.get("name", "?")[:24]
+            artist = item.get("artist", "")[:28]
+            # puce ronde verte si sélectionné
+            if selected:
+                draw.ellipse([8, y+6, 16, y+14], fill=SPOTIFY_GREEN)
+            else:
+                draw.ellipse([8, y+6, 16, y+14], fill=DARKGRAY)
+            draw.text((24, y), name, font=self.fs, fill=WHITE if selected else GRAY)
+            if artist:
+                draw.text((24, y+16), artist, font=self.fx, fill=DARKGRAY)
+        # hint
+        self._center(draw, "Milieu = jouer  │  Gauche = retour", self.fx, 260, DARKGRAY)
+
+    def _draw_player(self, draw):
+        np = self.now_playing
+        # Pochette placeholder carré arrondi SANS bordure verte
+        size = 150
+        x0 = (self.W - size) // 2
+        y0 = 14
+        radius = 12
+        draw.rounded_rectangle([x0, y0, x0+size, y0+size], radius=radius, fill=DARKGRAY)
+        # note
+        draw.text((x0+58, y0+58), "♪", font=self.fb, fill=GRAY)
+        # Titre / artiste
+        title = np.get("name", "?")
+        artist = np.get("artist", "")
+        self._center(draw, title, self.fm, 178, WHITE, max_w=220)
+        if artist:
+            self._center(draw, artist, self.fs, 203, GRAY, max_w=220)
+        # Barre de progression
+        self._draw_progress(draw, np.get("progress", 0), np.get("duration", 0), y=230)
+        # Boutons de contrôle ronds : previous, play/pause, next
+        self._draw_controls(draw, y=246)
+
+    def _draw_progress(self, draw, progress, duration, y):
+        bar_w = 200
+        x0 = (self.W - bar_w) // 2
+        draw.rounded_rectangle([x0, y, x0+bar_w, y+6], radius=3, fill=DARKGRAY)
+        if duration:
+            ratio = min(1.0, progress / duration)
+        else:
+            ratio = 0.0
+        fill_w = int(bar_w * ratio)
+        cx = x0 + fill_w
+        # barre verte remplie
+        if fill_w:
+            draw.rounded_rectangle([x0, y, cx, y+6], radius=3, fill=SPOTIFY_GREEN)
+        # curseur rond
+        draw.ellipse([cx-5, y-2, cx+5, y+8], fill=SPOTIFY_GREEN)
+        # temps
+        def fmt(s):
+            s = int(s)
+            return f"{s//60}:{s%60:02d}"
+        draw.text((x0, y+12), fmt(progress), font=self.fx, fill=GRAY)
+        end_x = x0 + bar_w - 40
+        draw.text((end_x, y+12), fmt(duration), font=self.fx, fill=GRAY)
+
+    def _draw_controls(self, draw, y):
+        # 3 boutons ronds : previous, play/pause, next (comme Spotify)
+        # si pause = ▌▌, si play = ▶
+        np = self.now_playing
+        is_playing = np.get("is_playing", False)
+        labels = ["|◀", "▌▌" if is_playing else "▶", "▶▶"]
+        names = ["previous", "play_pause", "next"]
+        # positions centrées : 52, 120, 188
+        xs = [52, 120, 188]
+        for i, (lab, name) in enumerate(zip(labels, names)):
+            x = xs[i]
+            selected = (i == self.control_idx)
+            r = 22 if selected else 19
+            color = SPOTIFY_GREEN if selected else DARKGRAY
+            draw.ellipse([x-r, y-r, x+r, y+r], fill=color)
+            # label en blanc/noir selon contraste
+            fill = BLACK if selected else WHITE
+            font = self.fs if not selected else self.fm
+            bbox = draw.textbbox((0,0), lab, font=font)
+            tw = bbox[2]-bbox[0]
+            th = bbox[3]-bbox[1]
+            draw.text((x-tw//2, y-th//2), lab, font=font, fill=fill)
+        # hint
+        self._center(draw, "Haut/Bas = bouton  │  Gauche = retour", self.fx, 275, DARKGRAY)

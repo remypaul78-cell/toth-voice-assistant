@@ -1,0 +1,8 @@
+{
+  "groq_api_key": "GROQ_KEY_REDACTED",
+  "gmail_app_password": "kcfp yhjr adui pdih",
+  "gmail_email": "remypaul78@gmail.com",
+  "button_pin": 17,
+  "record_duration": 5,
+  "last_uid_file": "/home/pi/toth/.last_mail_uid"
+}

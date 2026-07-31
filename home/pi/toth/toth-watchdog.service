@@ -1,0 +1,12 @@
+[Unit]
+Description=Toth watchdog — restart if Toth appears dead
+After=toth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/toth_watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

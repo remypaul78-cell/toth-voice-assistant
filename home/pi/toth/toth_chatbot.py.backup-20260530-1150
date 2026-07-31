@@ -1,0 +1,752 @@
+#!/usr/bin/env python3
+# Toth Chatbot - talks directly to Hermes Gateway via local API (no Telegram conflict)
+import sys, os, time, threading, subprocess, json, signal, uuid
+from datetime import datetime
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+with open("/home/pi/toth/config.json") as f:
+    C = json.load(f)
+
+T_T = C.get("telegram_bot_token", "")
+T_C = C.get("telegram_chat_id", "5754223758")
+O_K = C.get("ollama_api_key", "")
+G_K = C.get("groq_api_key", "")
+
+# Hermes API locale
+HERMES_API = "http://127.0.0.1:8080"
+HERMES_KEY = "toth-local-key-2026"
+
+SAMPLE_RATE = 16000
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+RECORD_PATH = "/tmp/toth_audio.wav"
+POLL_INT = 2.0
+SESSION_ID = None  # On garde la meme session pour contexte continu
+
+print(f"[TOTH] T_T len={len(T_T)} OK={bool(T_T)}")
+print(f"[TOTH] T_C={T_C}")
+print(f"[TOTH] O_K len={len(O_K)} OK={bool(O_K)}")
+print(f"[TOTH] Hermes API: {HERMES_API}")
+
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from edge_tts import Communicate
+
+sys.path.insert(0, "/home/pi/whisplay/runtime")
+from whisplay import WhisplayBoard
+
+COLOR_IDLE   = (0x00, 0x00, 0x55)
+COLOR_RECORD = (0x00, 0xFF, 0x00)
+COLOR_ASR    = (0xFF, 0x68, 0x00)
+COLOR_ANSWER = (0x00, 0xC8, 0xA3)
+COLOR_ERROR  = (0xFF, 0x00, 0x00)
+
+STATE_IDLE = "idle"
+STATE_RECORD = "record"
+STATE_PROCESS = "process"
+STATE_WAITING = "waiting"
+
+IDLE_IMAGE = "/home/pi/toth/toth_idle.raw"  # Thoth background image (240x280 RGB565)
+
+# Battery overlay
+import smbus2
+PI_SUGAR_ADDR = 0x57
+
+def read_battery():
+    """Return battery percentage from PiSugar I2C (register 0x2A), or -1."""
+    try:
+        bus = smbus2.SMBus(1)
+        pct = bus.read_byte_data(PI_SUGAR_ADDR, 0x2A)
+        bus.close()
+        return max(0, min(100, pct))
+    except Exception:
+        return -1
+
+def overlay_battery_on_raw(raw_bytes, width=240, height=280):
+    """Overlay battery icon directly in RGB565 — NO PIL conversion, fast on Pi Zero."""
+    buf = bytearray(raw_bytes)  # mutable copy
+    
+    pct = read_battery()
+    if pct < 0:
+        pct = 0
+    
+    # Icon position (top-right)
+    icon_w, icon_h = 56, 24
+    margin_right, margin_top = 8, 4
+    bx = width - margin_right - icon_w
+    by = margin_top
+    body_w = icon_w - 6
+    
+    # Colors in RGB565
+    GRAY565 = 0x8410       # #888888
+    GREEN565 = 0x2648       # #4CAF50
+    YELLOW565 = 0xFE40      # #FFC107
+    RED565 = 0xF800         # #F44336
+    BLACK565 = 0x0000
+    WHITE565 = 0xFFFF
+    
+    if pct > 60:
+        fill565 = GREEN565
+    elif pct > 20:
+        fill565 = YELLOW565
+    else:
+        fill565 = RED565
+    
+    def put_pixel(px_x, py, color):
+        if 0 <= px_x < width and 0 <= py < height:
+            off = (py * width + px_x) * 2
+            buf[off] = (color >> 8) & 0xFF
+            buf[off + 1] = color & 0xFF
+    
+    def draw_rect(px_x1, py1, px_x2, py2, color):
+        for py in range(py1, py2):
+            for px_x in range(px_x1, px_x2):
+                put_pixel(px_x, py, color)
+    
+    def draw_h_line(px_x1, px_x2, py, color):
+        for px_x in range(px_x1, px_x2):
+            put_pixel(px_x, py, color)
+    
+    def draw_v_line(px_x, py1, py2, color):
+        for py in range(py1, py2):
+            put_pixel(px_x, py, color)
+    
+    # Battery body outline (2px border)
+    # Top edge
+    draw_h_line(bx + 2, bx + body_w - 2, by, GRAY565)
+    draw_h_line(bx + 1, bx + body_w - 1, by + 1, GRAY565)
+    # Bottom edge
+    draw_h_line(bx + 2, bx + body_w - 2, by + icon_h - 1, GRAY565)
+    draw_h_line(bx + 1, bx + body_w - 1, by + icon_h - 2, GRAY565)
+    # Left edge
+    draw_v_line(bx, by + 2, by + icon_h - 2, GRAY565)
+    draw_v_line(bx + 1, by + 2, by + icon_h - 2, GRAY565)
+    # Right edge
+    draw_v_line(bx + body_w - 1, by + 2, by + icon_h - 2, GRAY565)
+    draw_v_line(bx + body_w - 2, by + 2, by + icon_h - 2, GRAY565)
+    # Rounded corners (simplify: fill corners with black background)
+    for corner_y in [by, by + 1, by + icon_h - 2, by + icon_h - 1]:
+        for corner_x in [bx, bx + 1, bx + body_w - 2, bx + body_w - 1]:
+            # Only black out pixels that are at the extreme corners
+            if (corner_x in [bx, bx + 1] and corner_y in [by, by + 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+            if (corner_x in [bx + body_w - 2, bx + body_w - 1] and corner_y in [by, by + 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+            if (corner_x in [bx, bx + 1] and corner_y in [by + icon_h - 2, by + icon_h - 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+            if (corner_x in [bx + body_w - 2, bx + body_w - 1] and corner_y in [by + icon_h - 2, by + icon_h - 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+    
+    # Battery tip
+    tip_x = bx + body_w
+    tip_w = 4
+    tip_h = icon_h // 2
+    tip_y = by + tip_h // 2
+    draw_rect(tip_x, tip_y, tip_x + tip_w, tip_y + tip_h, GRAY565)
+    
+    # Fill level
+    fm = 3
+    fw = int((body_w - 2*fm) * pct / 100)
+    if fw > 0:
+        draw_rect(bx + fm, by + fm, bx + fm + fw, by + icon_h - fm, fill565)
+    
+    # Percentage text using simple 5x7 font rendered directly
+    text = f"{pct}%"
+    # Simple bitmap font (5 wide × 7 tall) — render manually
+    FONT_MAP = {
+        '0': [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1': [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2': [0b01110, 0b10001, 0b00001, 0b00110, 0b01100, 0b10000, 0b11111],
+        '3': [0b01110, 0b10001, 0b00001, 0b01110, 0b00001, 0b10001, 0b01110],
+        '4': [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5': [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6': [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7': [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000],
+        '8': [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9': [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+        '%': [0b10001, 0b10011, 0b00010, 0b00100, 0b01000, 0b11001, 0b10001],
+    }
+    text_pixels_w = 0
+    for ch in text:
+        text_pixels_w += 6 if ch == '%' else 6  # 5 pixels + 1 gap
+    text_pixels_w -= 1  # no gap after last char
+    text_x = bx + (body_w - text_pixels_w) // 2
+    text_y = by + (icon_h - 7) // 2 - 1
+    
+    for ch in text:
+        if ch not in FONT_MAP:
+            continue
+        glyph = FONT_MAP[ch]
+        for row in range(7):
+            for col in range(5):
+                if glyph[row] & (1 << (4 - col)):
+                    px = text_x + col
+                    py = text_y + row
+                    # Dark outline
+                    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                        put_pixel(px + dx, py + dy, BLACK565)
+                    put_pixel(px, py, WHITE565)
+        text_x += 6
+    
+    return bytes(buf)
+
+# Radio integration
+sys.path.insert(0, "/home/pi/toth")
+import radio as radio_mod
+RADIO_WAS_PLAYING = None  # Remember which radio to resume after TTS
+
+TG_API = "https://api.telegram.org/bot" + T_T
+
+def tg_send(text):
+    """Send a message to Telegram - simple POST, no polling, no conflict."""
+    if not T_T or not T_C:
+        return None
+    try:
+        r = requests.post(TG_API + "/sendMessage",
+            json={"chat_id": T_C, "text": text, "parse_mode": "Markdown"},
+            timeout=10)
+        if r.status_code == 200:
+            return r.json()["result"]["message_id"]
+    except Exception:
+        pass
+    return None
+
+def raw565_to_pil(raw, w=240, h=280):
+    """Convert RGB565 raw bytes to PIL RGB Image (cached for performance)."""
+    img = Image.new("RGB", (w, h))
+    px = img.load()
+    for y in range(h):
+        for x in range(w):
+            off = (y * w + x) * 2
+            val = (raw[off] << 8) | raw[off + 1]
+            r = ((val >> 11) & 0x1F) << 3
+            g = ((val >> 5) & 0x3F) << 2
+            b = (val & 0x1F) << 3
+            px[x, y] = (r, g, b)
+    return img
+
+def pil_to_rgb565(img):
+    """Convert PIL RGB Image to raw RGB565 bytes."""
+    px = img.load()
+    buf = bytearray()
+    for y in range(img.height):
+        for x in range(img.width):
+            r, g, b = px[x, y]
+            val = (((r >> 3) & 0x1F) << 11) | (((g >> 2) & 0x3F) << 5) | ((b >> 3) & 0x1F)
+            buf.append((val >> 8) & 0xFF)
+            buf.append(val & 0xFF)
+    return bytes(buf)
+
+def render_text_on_bg(bg_pil, text, font_size=16, max_lines=14):
+    """Render text over a PIL background image — no black flash."""
+    img = bg_pil.copy()
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype(FONT_PATH, font_size)
+    except Exception:
+        font = ImageFont.load_default()
+    
+    # Draw semi-transparent dark overlay for readability
+    overlay = Image.new("RGBA", (240, 280), (0, 0, 0, 140))
+    img_rgba = img.convert("RGBA")
+    img_rgba.paste(overlay, (0, 0), overlay)
+    img = img_rgba.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    
+    # Word wrap
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        b = draw.textbbox((0, 0), t, font=font)
+        if (b[2] - b[0]) > 224:
+            if cur:
+                lines.append(cur)
+            cur = w
+        else:
+            cur = t
+    if cur:
+        lines.append(cur)
+    lines = lines[:max_lines]
+    
+    y = 8
+    for line in lines:
+        draw.text((8, y), line, font=font, fill="#FFFFFF")
+        y += font_size + 2
+    
+    return pil_to_rgb565(img)
+
+
+def render_robot_face(force_expr=None):
+    """Eilik-style robot face: rotating expressions every 5s + time-of-day mood."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = 240, 280
+    img = Image.new("RGB", (W, H), "#000000")
+    draw = ImageDraw.Draw(img)
+
+    now = datetime.now()
+    hour = now.hour
+    sec = now.second
+    tod = "morning" if 6 <= hour < 12 else ("day" if 12 <= hour < 18 else ("evening" if 18 <= hour < 22 else "night"))
+
+    expr_idx = force_expr if force_expr is not None else ((sec // 5) % 10)
+    eye_y, mouth_y = 110, 180
+    left_eye_x, right_eye_x = 85, 155
+
+    def de(ex, ey, r, f, o="#667799"): draw.ellipse([ex-r, ey-r, ex+r, ey+r], fill=f, outline=o, width=1)
+    def dhe(ex, ey, s=24, f="#FF3366"):
+        cx, cy, h = ex, ey - s//3, s//2
+        draw.ellipse([cx-h, cy-h, cx, cy], fill=f); draw.ellipse([cx, cy-h, cx+h, cy], fill=f)
+        draw.polygon([cx-h, cy-3, cx+h, cy-3, cx, cy+h], fill=f)
+    def dwe(ex, ey, r=26): de(ex, ey, r, "#FFFFFF")
+    def dce(ex, ey, w=18): draw.arc([ex-w, ey-5, ex+w, ey+5], 0, 180, fill="#FFFFFF", width=3)
+    def dp(ex, ey, ox=0, oy=0, r=9, c="#111122"): draw.ellipse([ex-r+ox, ey-r+oy, ex+r+ox, ey+r+oy], fill=c)
+    def ds(ex, ey, ox=0, oy=0, r=3): draw.ellipse([ex-r+ox, ey-r+oy, ex+r+ox, ey+r+oy], fill="#FFFFFF")
+    def dsm(my, big=False, c="#FFFFFF"):
+        if big: draw.arc([85, my-18, 155, my+18], 0, 180, fill=c, width=3)
+        else: draw.arc([95, my-12, 145, my+12], 0, 180, fill=c, width=2)
+    def dom(my): draw.ellipse([110, my-6, 130, my+6], fill="#334455")
+
+    if tod == "night" and expr_idx < 5:
+        # Sleeping, no Zzz
+        dce(left_eye_x, eye_y); dce(right_eye_x, eye_y); dom(mouth_y)
+    elif expr_idx == 0:
+        dhe(left_eye_x, eye_y); dhe(right_eye_x, eye_y); dsm(mouth_y, True, "#FF6688")
+    elif expr_idx == 1:
+        dwe(left_eye_x, eye_y); dp(left_eye_x, eye_y, r=8); ds(left_eye_x, eye_y, 4, -4)
+        dce(right_eye_x, eye_y); dsm(mouth_y)
+        try: fz = ImageFont.truetype(FONT_PATH, 14)
+        except: fz = ImageFont.load_default()
+        draw.text((left_eye_x+18, eye_y-28), "✨", font=fz, fill="#FFD700")
+    elif expr_idx == 2:
+        dwe(left_eye_x, eye_y, 30); dp(left_eye_x, eye_y, r=11, ox=2, oy=-2); ds(left_eye_x, eye_y, 6, -6, 4); ds(left_eye_x, eye_y, -6, 2, 3)
+        dwe(right_eye_x, eye_y, 30); dp(right_eye_x, eye_y, r=11, ox=2, oy=-2); ds(right_eye_x, eye_y, 6, -6, 4)
+        dsm(mouth_y, True)
+    elif expr_idx == 3:
+        dwe(left_eye_x, eye_y); dp(left_eye_x, eye_y, r=9); ds(left_eye_x, eye_y, 4, -4)
+        dwe(right_eye_x, eye_y); dp(right_eye_x, eye_y, r=9, ox=-3, oy=2); ds(right_eye_x, eye_y, -2, -4)
+        dsm(mouth_y, True, "#FFD700")
+        try: fn = ImageFont.truetype(FONT_PATH, 16)
+        except: fn = ImageFont.load_default()
+        draw.text((150, eye_y-38), "♪", font=fn, fill="#FFD700")
+        draw.text((45, eye_y-32), "♫", font=fn, fill="#FFAA00")
+    elif expr_idx == 4:
+        dwe(left_eye_x, eye_y, 28); dp(left_eye_x, eye_y, r=13, oy=4, c="#2244AA"); ds(left_eye_x, eye_y, 6, -2, 4)
+        dwe(right_eye_x, eye_y, 28); dp(right_eye_x, eye_y, r=13, oy=4, c="#2244AA"); ds(right_eye_x, eye_y, 6, -2, 4)
+        draw.arc([100, mouth_y+5, 140, mouth_y+20], 0, 180, fill="#8899CC", width=2)
+    elif expr_idx == 5:
+        dce(left_eye_x, eye_y); dce(right_eye_x, eye_y); dsm(mouth_y, True, "#FFDD44")
+    elif expr_idx == 6:
+        dwe(left_eye_x, eye_y-5); dp(left_eye_x, eye_y-5, oy=-2)
+        dwe(right_eye_x, eye_y+5); dp(right_eye_x, eye_y+5, ox=2, oy=2)
+        draw.ellipse([112, mouth_y-3, 128, mouth_y+6], fill="#334455")
+    elif expr_idx == 7:
+        # 👀 BIG EYES — "message lu" / surprise
+        dwe(left_eye_x, eye_y, 32); dp(left_eye_x, eye_y, r=6)
+        dwe(right_eye_x, eye_y, 32); dp(right_eye_x, eye_y, r=6)
+        draw.ellipse([108, mouth_y-12, 132, mouth_y+12], fill="#334455")
+    elif expr_idx == 8:
+        scl = "#FFDDDD" if tod == "evening" else "#FFFFFF"
+        pc = "#8B0000" if tod == "evening" else "#111122"
+        for ex in [left_eye_x, right_eye_x]:
+            de(ex, eye_y, 26, scl)
+            draw.rectangle([ex-28, eye_y-28, ex+28, eye_y-2], fill="#000000")
+            dp(ex, eye_y, oy=8, r=5, c=pc)
+        draw.arc([98, mouth_y-6, 142, mouth_y+6], 0, 180, fill="#668888", width=2)
+    else:
+        dwe(left_eye_x, eye_y); dp(left_eye_x, eye_y, r=9); ds(left_eye_x, eye_y, 4, -4)
+        dwe(right_eye_x, eye_y); dp(right_eye_x, eye_y, r=9, ox=1, oy=-1); ds(right_eye_x, eye_y, 4, -5)
+        dsm(mouth_y)
+
+    return pil_to_rgb565(img)
+
+
+def render_clock_only():
+    """Simple clock display — time + date on black."""
+    from PIL import Image, ImageDraw, ImageFont
+    W, H = 240, 280
+    img = Image.new("RGB", (W, H), "#000000")
+    draw = ImageDraw.Draw(img)
+    now = datetime.now()
+    time_str = now.strftime("%H:%M")
+    date_str = now.strftime("%d/%m/%Y")
+    try:
+        ft = ImageFont.truetype(FONT_PATH, 42)
+        fd = ImageFont.truetype(FONT_PATH, 16)
+    except:
+        ft = fd = ImageFont.load_default()
+    bb = draw.textbbox((0,0), time_str, font=ft)
+    draw.text(((W-(bb[2]-bb[0]))//2, 100), time_str, font=ft, fill="#FFFFFF")
+    bb = draw.textbbox((0,0), date_str, font=fd)
+    draw.text(((W-(bb[2]-bb[0]))//2, 160), date_str, font=fd, fill="#888888")
+    return pil_to_rgb565(img)
+
+
+class AudioRecorder:
+    def __init__(self, out, dev="plughw:1,0"):
+        self.out = out; self.dev = dev; self.proc = None
+    def start(self):
+        self.proc = subprocess.Popen(
+            ["arecord", "-D", self.dev, "-f", "S16_LE", "-r", str(SAMPLE_RATE),
+             "-c", "1", self.out],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid)
+        return True
+    def stop(self):
+        if not self.proc: return False
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            self.proc.wait(timeout=5)
+            return os.path.exists(self.out) and os.path.getsize(self.out) > 0
+        except Exception:
+            try: self.proc.kill()
+            except Exception: pass
+            return False
+
+def transcribe(path):
+    if not os.path.exists(path):
+        print(f"[ASR] File not found: {path}")
+        return None
+    fsize = os.path.getsize(path)
+    print(f"[ASR] Transcribing {fsize} bytes via Groq...")
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": "Bearer " + G_K},
+                files={"file": ("audio.wav", f, "audio/wav")},
+                data={"model": "whisper-large-v3", "language": "fr", "response_format": "json"},
+                timeout=60)
+        print(f"[ASR] HTTP {r.status_code}")
+        if r.status_code == 200:
+            t = r.json().get("text", "").strip()
+            print(f"[ASR] Result: {t[:80]}")
+            return t if t else None
+        else:
+            print(f"[ASR] Error: {r.text[:200]}")
+    except Exception as e:
+        print(f"[ASR] Exception: {e}")
+    return None
+
+def speak(text):
+    """Prononce un texte. Coupe la radio si elle joue, puis la relance après."""
+    global RADIO_WAS_PLAYING
+    if not text:
+        return False
+
+    # 1. Stop radio if playing, remember which one
+    radio_was_on = os.path.exists(radio_mod.PID_FILE)
+    if radio_was_on:
+        # Read radio name from state file before stopping
+        state_file = "/tmp/toth_radio_state"
+        if os.path.exists(state_file):
+            with open(state_file) as f:
+                RADIO_WAS_PLAYING = f.read().strip()
+            print(f"[TTS] Radio {RADIO_WAS_PLAYING} playing — pausing...")
+        radio_mod.stop_radio()
+        time.sleep(0.5)  # Let audio device release
+
+    print(f"[TTS] Speaking: {text[:80]}...")
+    tmp = "/tmp/toth_speech.mp3"
+    try:
+        import asyncio
+        async def s():
+            c = Communicate(text, "fr-FR-RemyMultilingualNeural")
+            with open(tmp, "wb") as f:
+                async for ch in c.stream():
+                    if ch["type"] == "audio": f.write(ch["data"])
+        asyncio.run(s())
+        # Prioritize Bluetooth AirPods, then built-in speaker, then fallback
+        airpods_sink = "bluez_output.E4_90_FD_E3_4A_D3.1"
+        devices = [
+            ("pulse", "PulseAudio (AirPods)"),
+            ("hw:1,0", "WM8960 speaker"),
+            ("default", "ALSA default"),
+        ]
+        played = False
+        for dev, label in devices:
+            # Route PulseAudio to AirPods if they're connected
+            if dev == "pulse":
+                try:
+                    subprocess.run(
+                        ["pactl", "set-default-sink", airpods_sink],
+                        timeout=3, capture_output=True
+                    )
+                except Exception:
+                    pass
+            rr = subprocess.run(["mpg123", "-q", "-a", dev, tmp],
+                                timeout=60, capture_output=True)
+            if rr.returncode == 0:
+                print(f"[TTS] Played on {label}")
+                played = True
+                break
+        if not played:
+            print("[TTS] Playback failed on all devices")
+    except Exception as e:
+        print(f"[TTS] Exception: {e}")
+        return False
+
+    # 3. Resume radio if it was playing
+    if RADIO_WAS_PLAYING:
+        print(f"[TTS] Resuming radio: {RADIO_WAS_PLAYING}")
+        radio_mod.play_radio(RADIO_WAS_PLAYING)
+        RADIO_WAS_PLAYING = None
+
+    return True
+
+def hermes_ask(question):
+    """Send question directly to Hermes Gateway and get response"""
+    global SESSION_ID
+    try:
+        payload = {
+            "model": "deepseek-v4-pro",
+            "messages": [{"role": "user", "content": question}],
+            "stream": False
+        }
+        if SESSION_ID:
+            payload["session_id"] = SESSION_ID
+        headers = {
+            "Authorization": f"Bearer {HERMES_KEY}",
+            "Content-Type": "application/json"
+        }
+        print(f"[API] POST {HERMES_API}/v1/chat/completions...")
+        r = requests.post(
+            f"{HERMES_API}/v1/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=180
+        )
+        print(f"[API] HTTP {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            # Extract response
+            choices = data.get("choices", [])
+            if choices:
+                content = choices[0].get("message", {}).get("content", "")
+                # Save session ID for continuity
+                sid = data.get("hermes_session_id") or data.get("session_id")
+                if sid:
+                    SESSION_ID = sid
+                    print(f"[API] Session: {sid}")
+                return content.strip() if content else None
+            else:
+                print("[API] No choices in response")
+        else:
+            print(f"[API] Error: {r.text[:300]}")
+    except Exception as e:
+        print(f"[API] Exception: {e}")
+    return None
+
+class TothChatbot:
+    def __init__(self):
+        self.state = STATE_IDLE
+        self.board = None; self.rec = None
+        self.lock = threading.Lock()
+        self._clock_running = False  # Robot clock thread flag
+        self._clock_thread = None
+        self._batt_timer = None
+        print("[TOTH] Initializing WhisplayBoard...")
+        self.board = WhisplayBoard()
+        self.board.set_backlight(50)
+        self.board.on_button_press(self._btn)
+        self.board.on_button_release(lambda: None)
+        # Start robot clock immediately, no Thoth image
+        self._start_clock()
+        print("[TOTH] Ready. Hermes direct mode.")
+
+    def _rgb(self, r, g, b):
+        try: self.board.set_rgb(r, g, b)
+        except Exception: pass
+
+    def _disp(self, text, fs=16):
+        """Display text on black background (clock is stopped during interactions)."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.new("RGB", (240, 280), "#000000")
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype(FONT_PATH, fs)
+            except:
+                font = ImageFont.load_default()
+            words = text.split()
+            lines = []; cur = ""
+            for w in words:
+                t = (cur + " " + w).strip()
+                b = draw.textbbox((0, 0), t, font=font)
+                if (b[2] - b[0]) > 224:
+                    if cur: lines.append(cur)
+                    cur = w
+                else:
+                    cur = t
+            if cur: lines.append(cur)
+            y = 8
+            for line in lines[:14]:
+                draw.text((8, y), line, font=font, fill="#FFFFFF")
+                y += fs + 2
+            data = pil_to_rgb565(img)
+            self.board.draw_image(0, 0, 240, 280, data)
+        except Exception as e:
+            print(f"[DISP] {e}")
+
+    def _start_clock(self):
+        """Start robot face loop in background thread."""
+        if self._clock_running:
+            return
+        self._clock_running = True
+        self._rgb(0, 0, 0)  # LED off during face display
+        def loop():
+            while self._clock_running:
+                try:
+                    data = render_robot_face()
+                    self.board.draw_image(0, 0, 240, 280, data)
+                except Exception as e:
+                    print(f"[FACE] Error: {e}")
+                    break
+                time.sleep(5)
+        self._clock_thread = threading.Thread(target=loop, daemon=True)
+        self._clock_thread.start()
+        self._batt_timer = threading.Timer(900, self._send_battery_telegram)
+        self._batt_timer.daemon = True
+        self._batt_timer.start()
+        print("[FACE] Started")
+
+    def _stop_clock(self):
+        self._clock_running = False
+        if self._batt_timer:
+            self._batt_timer.cancel()
+            self._batt_timer = None
+
+    def _btn(self):
+        print(f"[BTN] Press detected, state={self.state}")
+        with self.lock: s = self.state
+        if s == STATE_IDLE: self._record()
+        elif s == STATE_RECORD: self._process()
+
+    def _record(self):
+        global RADIO_WAS_PLAYING
+        print("[REC] Starting recording...")
+        self._stop_clock()
+        # Stop radio if playing, remember which one to resume later
+        radio_was_on = os.path.exists(radio_mod.PID_FILE)
+        if radio_was_on:
+            state_file = "/tmp/toth_radio_state"
+            if os.path.exists(state_file):
+                with open(state_file) as f:
+                    RADIO_WAS_PLAYING = f.read().strip()
+                print(f"[REC] Radio {RADIO_WAS_PLAYING} playing — stopping for recording...")
+            radio_mod.stop_radio()
+            time.sleep(0.3)
+        with self.lock: self.state = STATE_RECORD
+        self._disp("Recording...\nPress again when done.", 16)
+        self.rec = AudioRecorder(RECORD_PATH)
+        if not self.rec.start():
+            self._disp("Mic error"); time.sleep(2)
+            self._idle()
+
+    def _process(self):
+        print("[PROC] Stopping recording...")
+        with self.lock: self.state = STATE_PROCESS
+        self._disp("Processing...", 16)
+        if self.rec:
+            ok = self.rec.stop(); self.rec = None
+            if not ok:
+                self._disp("Empty recording.\nTry again.")
+                time.sleep(2); self._idle(); return
+        q = transcribe(RECORD_PATH)
+        if not q:
+            self._disp("Not understood.\nTry again.")
+            time.sleep(2); self._idle(); return
+        self._disp("> " + q, 14)
+        threading.Thread(target=self._ask_hermes, args=(q,), daemon=True).start()
+
+    def _show_face_override(self, expr_idx, duration=3):
+        """Flash a specific expression for duration seconds."""
+        try:
+            data = render_robot_face(force_expr=expr_idx)
+            self.board.draw_image(0, 0, 240, 280, data)
+            time.sleep(duration)
+        except Exception as e:
+            print(f"[FACE] Override error: {e}")
+
+    def _ask_hermes(self, question):
+        self._stop_clock()
+        # 👀 Big eyes — "message lu"
+        self._show_face_override(7, duration=2)
+        with self.lock: self.state = STATE_WAITING
+        self._disp("Thinking...", 18)
+        threading.Thread(target=tg_send, args=("*Question:* " + question,), daemon=True).start()
+        answer = hermes_ask(question)
+        if answer:
+            self._disp(answer, 15)
+            threading.Thread(target=tg_send, args=(answer,), daemon=True).start()
+            # ❤️ Heart eyes when answer posted
+            self._show_face_override(0, duration=4)
+            threading.Thread(target=self._speak_and_idle, args=(answer,), daemon=True).start()
+        else:
+            self._disp("No response. Try again.")
+            time.sleep(2)
+            self._idle()
+
+    def _speak_and_idle(self, text):
+        speak(text)
+        self._idle()
+
+    def _idle(self):
+        global RADIO_WAS_PLAYING
+        print("[IDLE] Returning to idle...")
+        with self.lock: self.state = STATE_IDLE
+        # Resume radio if it was playing before recording
+        if RADIO_WAS_PLAYING:
+            print(f"[IDLE] Resuming radio: {RADIO_WAS_PLAYING}")
+            radio_mod.play_radio(RADIO_WAS_PLAYING)
+            RADIO_WAS_PLAYING = None
+        # Restart face loop
+        self._start_clock()
+
+    def _send_battery_telegram(self):
+        """Send battery status to Telegram chat (not on LCD to avoid flicker)."""
+        print("[BATT] Sending battery to Telegram...")
+        pct = read_battery()
+        if 0 <= pct <= 100:
+            emoji = "🔋" if pct > 60 else ("🔶" if pct > 20 else "🪫")
+            msg = f"{emoji} Batterie Toth : {pct}%"
+        else:
+            msg = "⚠️ Batterie Toth : indétectable"
+        try:
+            url = f"https://api.telegram.org/bot{T_T}/sendMessage"
+            requests.post(url, json={"chat_id": T_C, "text": msg}, timeout=5)
+            print(f"[BATT] Sent: {msg}")
+        except Exception as e:
+            print(f"[BATT] Telegram error: {e}")
+        # Re-schedule
+        if self._batt_timer:
+            self._batt_timer.cancel()
+        self._batt_timer = threading.Timer(900, self._send_battery_telegram)
+        self._batt_timer.daemon = True
+        self._batt_timer.start()
+
+    def run(self):
+        print("[TOTH] Started (Hermes direct mode).")
+        try:
+            while True:
+                time.sleep(POLL_INT)
+        except KeyboardInterrupt:
+            print("[TOTH] Shutdown.")
+        finally: self._down()
+
+    def _down(self):
+        self._rgb(0, 0, 0)
+        if self.rec:
+            try: self.rec.stop()
+            except Exception: pass
+        if self.board:
+            try: self.board.cleanup()
+            except Exception: pass
+
+if __name__ == "__main__":
+    if not O_K:
+        print("ERROR: no ollama_api_key in config.json"); sys.exit(1)
+    TothChatbot().run()

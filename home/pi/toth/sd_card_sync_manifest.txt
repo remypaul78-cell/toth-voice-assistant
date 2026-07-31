@@ -1,0 +1,17 @@
+# Manifeste des chemins à synchroniser du Pi → carte SD branchée
+# Format: chemin_source_sur_le_Pi
+/home/pi/toth/
+/home/pi/yt_media/yt_state.json
+/home/pi/yt_media/audio/
+/home/pi/yt_media/video/
+/etc/systemd/system/toth.service
+/etc/systemd/system/toth-audio-router.service
+/etc/systemd/system/toth-autoheal.service
+/etc/systemd/system/toth-bot.service
+/etc/systemd/system/toth-bt-autoconnect.service
+/etc/systemd/system/toth-heartbeat.service
+/etc/systemd/system/toth-satellite-logger.service
+/etc/systemd/system/toth-watchdog.service
+/etc/systemd/system/toth-watcher.service
+/etc/systemd/system/bt-spoof.service
+/boot/firmware/config.txt

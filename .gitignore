@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.mp3
+*.wav
+*.ogg
+*.mp4
+books/
+audio/
+video/
+yt_media/
+camera/

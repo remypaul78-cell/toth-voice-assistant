@@ -1,0 +1,12 @@
+[Unit]
+Description=Toth Bluetooth auto-connect enceinte
+After=bluetooth.target sound.target
+Requires=bluetooth.target
+
+[Service]
+Type=oneshot
+User=pi
+ExecStart=/usr/local/bin/toth_bt_autoconnect.sh
+
+[Install]
+WantedBy=default.target

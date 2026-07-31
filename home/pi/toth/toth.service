@@ -1,0 +1,33 @@
+[Unit]
+Description=Toth Chatbot — Whisplay + Hermes hybride
+After=network-online.target sound.target bluetooth.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/toth
+Environment=HOME=/home/pi
+Environment=PULSE_RUNTIME_PATH=/run/user/1000/pulse
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+EnvironmentFile=-/home/pi/.hermes/.env
+ExecStart=/usr/bin/python3 -u /home/pi/toth/toth_chatbot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=toth
+
+# GPIO + audio access for user pi
+SupplementaryGroups=gpio audio pulse pulse-access bluetooth
+
+# Protection basique
+NoNewPrivileges=yes
+PrivateTmp=no
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=/home/pi/toth /tmp /run/user/1000 /var/run
+
+[Install]
+WantedBy=multi-user.target

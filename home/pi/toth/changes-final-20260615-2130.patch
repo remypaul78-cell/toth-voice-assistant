@@ -1,0 +1,107 @@
+--- toth_chatbot.py.bak-good	2026-06-15 19:26:47.690175991 +0000
++++ toth_chatbot.py.current	2026-06-15 19:30:25.027048467 +0000
+@@ -469,8 +469,8 @@
+         if not samples:
+             return
+         rms = math.sqrt(sum(s*s for s in samples) / len(samples))
+-        if rms < 500:
+-            print(f"[STREAM] Chunk RMS={rms:.0f} < 500 — skipped")
++        if rms < 1500:
++            print(f"[STREAM] Chunk RMS={rms:.0f} < 1500 — skipped")
+             return
+         tmp = "/tmp/toth_chunk.wav"
+         self._write_wav(tmp, data)
+@@ -1010,6 +1010,11 @@
+         self.board.set_backlight(100)
+         self.board.on_button_press(self._btn_press)
+         self.board.on_button_release(self._btn_release)
++        # -- Veille ecran --
++        self._last_activity = time.time()
++        self._screen_dimmed = False
++        self._idle_timeout = 300
++        threading.Thread(target=self._screen_idle_watcher, daemon=True).start()
+         # Start robot clock immediately, no Thoth image
+         self._show_menu(0)
+         self._start_clock()
+@@ -1026,7 +1031,7 @@
+         self._music_volume = 100
+         self._music_search_mode = False
+         # -- Media tabs --
+-        self._media_tabs = ["RADIO", "LIVRE", "ZIK"]
++        self._media_tabs = ["ZIK", "RADIO", "LIVRE"]
+         self._media_idx = 0
+         self._media_inside = False
+         self._media_music_sel = 0  # 0=Rechercher, 1=Mes playlists, 2=Recent
+@@ -1046,11 +1051,6 @@
+             self._bridge.start()
+         else:
+             self._bridge = None
+-        # -- Veille ecran --
+-        self._last_activity = time.time()
+-        self._screen_dimmed = False
+-        self._idle_timeout = 300
+-        threading.Thread(target=self._screen_idle_watcher, daemon=True).start()
+         print("[TOTH] Ready. Hermes direct mode.")
+ 
+     def _wake_screen(self):
+@@ -1449,6 +1449,11 @@
+             self._clear()
+         else:
+             self._disp("\\U0001f3a4 Parlez...")
++        # Baisser gain micro pour reduire bruit ambiant TV/Spotify
++        try:
++            os.popen("amixer -c 0 sset Capture 60%")
++        except Exception as e:
++            print(f"[REC] amixer error: {e}")
+         self.rec = AudioRecorder()
+         self._record_timeout = threading.Timer(MAX_RECORD_SEC, self._record_timeout_cb)
+         self._record_timeout.start()
+@@ -1950,9 +1955,11 @@
+                                 touch_active = False
+ 
+                                 if not had_position:
+-                                    # No position at all — treat as middle click
+-                                    print(f"[RING] Middle click (no pos, hold={dt_hold:.3f}s)")
+-                                    self._ring_action("record")
++                                    if dt_hold < 0.25:
++                                        print(f"[RING] Ghost tap ignored (no pos, hold={dt_hold:.3f}s)")
++                                    else:
++                                        print(f"[RING] Middle click (no pos, hold={dt_hold:.3f}s)")
++                                        self._ring_action("record")
+ 
+                                 elif x_first is not None:
+                                     # Calculate swipe distance (fix: bague n'envoie parfois que X)
+@@ -2820,9 +2827,8 @@
+                                     self._media_music_results_menu = False
+                                 return
+                             if self._media_music_sel == 0:
+-                                # Rechercher : lance la recherche vocale Spotify
+-                                self._music_search_mode = True
+-                                self._record(music=True)
++                                # Rechercher reserve au bouton physique (pas a la bague)
++                                print("[RING] Rechercher ignored via ring - use physical button")
+                                 return
+                             if self._media_music_sel == 3:
+                                 # Lecture : switch to now-playing screen
+@@ -3058,6 +3064,21 @@
+                             if action == "haut":
+                                 self._param_submenu_idx = (self._param_submenu_idx + 1) % len(tabs)
+                             else:
++                                self._param_submenu_idx = (self._param_submenu_idx - 1) % len(tabs)
++                            self._show_menu(self._menu_idx)
++                    elif cur_tab == "BOOT":
++                        if self._boot_submenu:
++                            if action in ("haut", "bas"):
++                                total = len(self._boot_options)
++                                if action == "haut":
++                                    self._boot_idx = (self._boot_idx + 1) % total
++                                else:
++                                    self._boot_idx = (self._boot_idx - 1) % total
++                                self._show_menu(self._menu_idx)
++                        else:
++                            if action == "haut":
++                                self._param_submenu_idx = (self._param_submenu_idx + 1) % len(tabs)
++                            else:
+                                 self._param_submenu_idx = (self._param_submenu_idx - 1) % len(tabs)
+                             self._show_menu(self._menu_idx)
+                     elif action == "haut":

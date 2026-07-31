@@ -1,0 +1,4 @@
+#!/bin/bash
+# Affiche un message sur l'écran de Toth (via le mécanisme d'override fichier)
+# Usage: toth_msg "Mon message"
+echo "$1" > /tmp/toth_display_override.txt

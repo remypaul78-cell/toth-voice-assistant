@@ -1,0 +1,16 @@
+[Unit]
+Description=Toth satellite serial logger
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/pi/toth/log_satellite.py
+Restart=always
+RestartSec=5
+User=pi
+Group=plugdev
+StandardOutput=append:/home/pi/toth/toth_satellite_serial.log
+StandardError=append:/home/pi/toth/toth_satellite_serial.log
+
+[Install]
+WantedBy=multi-user.target

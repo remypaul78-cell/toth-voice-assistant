@@ -1,0 +1,3938 @@
+#!/usr/bin/env python3
+# Toth Chatbot - talks directly to Hermes Gateway via local API (no Telegram conflict)
+import sys, os, time, threading, subprocess, json, signal, uuid, struct, urllib.request, collections, queue
+from datetime import datetime
+sys.path.insert(0, "/home/pi/toth")
+try:
+    from telethon_bridge import TothTelegramBridge
+except Exception as e:
+    TothTelegramBridge = None
+    print(f"[TELETHON BRIDGE] Import failed: {e}")
+
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
+with open("/home/pi/toth/config.json") as f:
+    C = json.load(f)
+
+T_T = C.get("telegram_bot_token", "")
+T_C = C.get("telegram_chat_id", "5754223758")
+O_K = C.get("ollama_api_key", "")
+G_K = C.get("groq_api_key", "")
+
+# Hermes API locale
+HERMES_API = "http://49.13.237.85:8080"
+HERMES_KEY = C.get("hermes_api_key", "hermes-vps-key-mesh-2026")
+
+SAMPLE_RATE = 16000
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"  # Rémy préfère DejaVuSans-Bold
+RECORD_PATH = "/tmp/toth_audio.wav"
+MAX_RECORD_SEC = 300  # 5min — l'Amiral decide quand envoyer    # timeout annulation après 10s sans validation
+POLL_INT = 2.0
+SESSION_ID = None  # On garde la meme session pour contexte continu
+
+# Pending question (stockée quand réponse en cours)
+
+print(f"[TOTH] T_T len={len(T_T)} OK={bool(T_T)}")
+print(f"[TOTH] T_C={T_C}")
+print(f"[TOTH] O_K len={len(O_K)} OK={bool(O_K)}")
+print(f"[TOTH] Hermes API: {HERMES_API}")
+
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from edge_tts import Communicate
+
+sys.path.insert(0, "/home/pi/whisplay/runtime")
+from whisplay import WhisplayBoard
+
+COLOR_IDLE   = (0x00, 0x00, 0x55)
+COLOR_RECORD = (0x00, 0xFF, 0x00)
+COLOR_ASR    = (0xFF, 0x68, 0x00)
+COLOR_ANSWER = (0x00, 0xC8, 0xA3)
+COLOR_ERROR  = (0xFF, 0x00, 0x00)
+
+STATE_IDLE = "idle"
+STATE_RECORD = "record"
+STATE_PROCESS = "process"
+STATE_WAITING = "waiting"
+
+IDLE_IMAGE = "/home/pi/toth/toth_idle.raw"  # Thoth background image (240x280 RGB565)
+
+# Battery overlay
+import smbus2
+
+# Prompt pour Whisper : force le contexte francais oral et bloque les hallucinations
+_WHISPER_PROMPT = (
+    "Transcription en francais. Pas de mots inventes, pas d'anglais, pas de repetitions. "
+    "Contexte : conversation entre l'Amiral Remy et son assistant Toth sur Raspberry Pi. "
+    "Vocabulaire : bague JX-05, Lilou, MemPalace, Palais de Lilou, enseigne, bosco, "
+    "PIRATE, Whisplay, WM8960, veille, reboot, edge-tts, systemd, GPIO, Bluetooth, AirPods."
+)
+PI_SUGAR_ADDR = 0x57
+
+def read_battery():
+    """Return battery percentage from PiSugar I2C (register 0x2A), or -1."""
+    try:
+        bus = smbus2.SMBus(1)
+        pct = bus.read_byte_data(PI_SUGAR_ADDR, 0x2A)
+        bus.close()
+        return max(0, min(100, pct))
+    except Exception:
+        return -1
+
+def overlay_battery_on_raw(raw_bytes, width=240, height=280):
+    """Overlay battery icon directly in RGB565 — NO PIL conversion, fast on Pi Zero."""
+    buf = bytearray(raw_bytes)  # mutable copy
+    
+    pct = read_battery()
+    if pct < 0:
+        pct = 0
+    
+    # Icon position (top-right)
+    icon_w, icon_h = 56, 24
+    margin_right, margin_top = 8, 4
+    bx = width - margin_right - icon_w
+    by = margin_top
+    body_w = icon_w - 6
+    
+    # Colors in RGB565
+    GRAY565 = 0x8410       # #888888
+    GREEN565 = 0x2648       # #4CAF50
+    YELLOW565 = 0xFE40      # #FFC107
+    RED565 = 0xF800         # #F44336
+    BLACK565 = 0x0000
+    WHITE565 = 0xFFFF
+    
+    if pct > 60:
+        fill565 = GREEN565
+    elif pct > 20:
+        fill565 = YELLOW565
+    else:
+        fill565 = RED565
+    
+    def put_pixel(px_x, py, color):
+        if 0 <= px_x < width and 0 <= py < height:
+            off = (py * width + px_x) * 2
+            buf[off] = (color >> 8) & 0xFF
+            buf[off + 1] = color & 0xFF
+    
+    def draw_rect(px_x1, py1, px_x2, py2, color):
+        for py in range(py1, py2):
+            for px_x in range(px_x1, px_x2):
+                put_pixel(px_x, py, color)
+    
+    def draw_h_line(px_x1, px_x2, py, color):
+        for px_x in range(px_x1, px_x2):
+            put_pixel(px_x, py, color)
+    
+    def draw_v_line(px_x, py1, py2, color):
+        for py in range(py1, py2):
+            put_pixel(px_x, py, color)
+    
+    # Battery body outline (2px border)
+    # Top edge
+    draw_h_line(bx + 2, bx + body_w - 2, by, GRAY565)
+    draw_h_line(bx + 1, bx + body_w - 1, by + 1, GRAY565)
+    # Bottom edge
+    draw_h_line(bx + 2, bx + body_w - 2, by + icon_h - 1, GRAY565)
+    draw_h_line(bx + 1, bx + body_w - 1, by + icon_h - 2, GRAY565)
+    # Left edge
+    draw_v_line(bx, by + 2, by + icon_h - 2, GRAY565)
+    draw_v_line(bx + 1, by + 2, by + icon_h - 2, GRAY565)
+    # Right edge
+    draw_v_line(bx + body_w - 1, by + 2, by + icon_h - 2, GRAY565)
+    draw_v_line(bx + body_w - 2, by + 2, by + icon_h - 2, GRAY565)
+    # Rounded corners (simplify: fill corners with black background)
+    for corner_y in [by, by + 1, by + icon_h - 2, by + icon_h - 1]:
+        for corner_x in [bx, bx + 1, bx + body_w - 2, bx + body_w - 1]:
+            # Only black out pixels that are at the extreme corners
+            if (corner_x in [bx, bx + 1] and corner_y in [by, by + 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+            if (corner_x in [bx + body_w - 2, bx + body_w - 1] and corner_y in [by, by + 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+            if (corner_x in [bx, bx + 1] and corner_y in [by + icon_h - 2, by + icon_h - 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+            if (corner_x in [bx + body_w - 2, bx + body_w - 1] and corner_y in [by + icon_h - 2, by + icon_h - 1]):
+                put_pixel(corner_x, corner_y, BLACK565)
+    
+    # Battery tip
+    tip_x = bx + body_w
+    tip_w = 4
+    tip_h = icon_h // 2
+    tip_y = by + tip_h // 2
+    draw_rect(tip_x, tip_y, tip_x + tip_w, tip_y + tip_h, GRAY565)
+    
+    # Fill level
+    fm = 3
+    fw = int((body_w - 2*fm) * pct / 100)
+    if fw > 0:
+        draw_rect(bx + fm, by + fm, bx + fm + fw, by + icon_h - fm, fill565)
+    
+    # Percentage text using simple 5x7 font rendered directly
+    text = f"{pct}%"
+    # Simple bitmap font (5 wide × 7 tall) — render manually
+    FONT_MAP = {
+        '0': [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
+        '1': [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
+        '2': [0b01110, 0b10001, 0b00001, 0b00110, 0b01100, 0b10000, 0b11111],
+        '3': [0b01110, 0b10001, 0b00001, 0b01110, 0b00001, 0b10001, 0b01110],
+        '4': [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
+        '5': [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
+        '6': [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
+        '7': [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b10000],
+        '8': [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
+        '9': [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
+        '%': [0b10001, 0b10011, 0b00010, 0b00100, 0b01000, 0b11001, 0b10001],
+    }
+    text_pixels_w = 0
+    for ch in text:
+        text_pixels_w += 6 if ch == '%' else 6  # 5 pixels + 1 gap
+    text_pixels_w -= 1  # no gap after last char
+    text_x = bx + (body_w - text_pixels_w) // 2
+    text_y = by + (icon_h - 7) // 2 - 1
+    
+    for ch in text:
+        if ch not in FONT_MAP:
+            continue
+        glyph = FONT_MAP[ch]
+        for row in range(7):
+            for col in range(5):
+                if glyph[row] & (1 << (4 - col)):
+                    px = text_x + col
+                    py = text_y + row
+                    # Dark outline
+                    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+                        put_pixel(px + dx, py + dy, BLACK565)
+                    put_pixel(px, py, WHITE565)
+        text_x += 6
+    
+    return bytes(buf)
+
+# Radio integration
+sys.path.insert(0, "/home/pi/toth")
+import radio as radio_mod
+RADIO_WAS_PLAYING = None  # Remember which radio to resume after TTS
+
+TG_API = "https://api.telegram.org/bot" + T_T
+
+def tg_send(text):
+    """Send a message to Telegram - simple POST, no polling, no conflict."""
+    if not T_T or not T_C:
+        return None
+    try:
+        r = requests.post(TG_API + "/sendMessage",
+            json={"chat_id": T_C, "text": text},
+            timeout=10)
+        if r.status_code == 200:
+            return r.json()["result"]["message_id"]
+        else:
+            print(f"[TG] sendMessage failed: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"[TG] Exception: {e}")
+    return None
+
+def raw565_to_pil(raw, w=240, h=280):
+    """Convert RGB565 raw bytes to PIL RGB Image (cached for performance)."""
+    img = Image.new("RGB", (w, h))
+    px = img.load()
+    for y in range(h):
+        for x in range(w):
+            off = (y * w + x) * 2
+            val = (raw[off] << 8) | raw[off + 1]
+            r = ((val >> 11) & 0x1F) << 3
+            g = ((val >> 5) & 0x3F) << 2
+            b = (val & 0x1F) << 3
+            px[x, y] = (r, g, b)
+    return img
+
+def pil_to_rgb565(img):
+    """Convert PIL RGB Image to raw RGB565 bytes."""
+    px = img.load()
+    buf = bytearray()
+    for y in range(img.height):
+        for x in range(img.width):
+            r, g, b = px[x, y]
+            val = (((r >> 3) & 0x1F) << 11) | (((g >> 2) & 0x3F) << 5) | ((b >> 3) & 0x1F)
+            buf.append((val >> 8) & 0xFF)
+            buf.append(val & 0xFF)
+    return bytes(buf)
+
+def render_text_on_bg(bg_pil, text, font_size=16, max_lines=14):
+    """Render text over a PIL background image — no black flash."""
+    img = bg_pil.copy()
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype(FONT_PATH, font_size)
+    except Exception:
+        font = ImageFont.load_default()
+    
+    # Draw semi-transparent dark overlay for readability
+    overlay = Image.new("RGBA", (240, 280), (0, 0, 0, 140))
+    img_rgba = img.convert("RGBA")
+    img_rgba.paste(overlay, (0, 0), overlay)
+    img = img_rgba.convert("RGB")
+    draw = ImageDraw.Draw(img)
+    
+    # Word wrap
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        b = draw.textbbox((0, 0), t, font=font)
+        if (b[2] - b[0]) > 224:
+            if cur:
+                lines.append(cur)
+            cur = w
+        else:
+            cur = t
+    if cur:
+        lines.append(cur)
+    lines = lines[:max_lines]
+    
+    y = 8
+    for line in lines:
+        draw.text((8, y), line, font=font, fill="#FFFFFF")
+        y += font_size + 2
+    
+    return pil_to_rgb565(img)
+
+
+def render_robot_face(force_expr=None):
+    """Eilik-style robot face: rotating expressions every 5s + time-of-day mood."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = 240, 280
+    img = Image.new("RGB", (W, H), "#000000")
+    draw = ImageDraw.Draw(img)
+
+    now = datetime.now()
+    hour = now.hour
+    sec = now.second
+    tod = "morning" if 6 <= hour < 12 else ("day" if 12 <= hour < 18 else ("evening" if 18 <= hour < 22 else "night"))
+
+    expr_idx = force_expr if force_expr is not None else ((sec // 5) % 10)
+    eye_y, mouth_y = 110, 180
+    left_eye_x, right_eye_x = 85, 155
+
+    def de(ex, ey, r, f, o="#667799"): draw.ellipse([ex-r, ey-r, ex+r, ey+r], fill=f, outline=o, width=1)
+    def dhe(ex, ey, s=24, f="#FF3366"):
+        cx, cy, h = ex, ey - s//3, s//2
+        draw.ellipse([cx-h, cy-h, cx, cy], fill=f); draw.ellipse([cx, cy-h, cx+h, cy], fill=f)
+        draw.polygon([cx-h, cy-3, cx+h, cy-3, cx, cy+h], fill=f)
+    def dwe(ex, ey, r=26): de(ex, ey, r, "#FFFFFF")
+    def dce(ex, ey, w=18): draw.arc([ex-w, ey-5, ex+w, ey+5], 0, 180, fill="#FFFFFF", width=3)
+    def dp(ex, ey, ox=0, oy=0, r=9, c="#111122"): draw.ellipse([ex-r+ox, ey-r+oy, ex+r+ox, ey+r+oy], fill=c)
+    def ds(ex, ey, ox=0, oy=0, r=3): draw.ellipse([ex-r+ox, ey-r+oy, ex+r+ox, ey+r+oy], fill="#FFFFFF")
+    def dsm(my, big=False, c="#FFFFFF"):
+        if big: draw.arc([85, my-18, 155, my+18], 0, 180, fill=c, width=3)
+        else: draw.arc([95, my-12, 145, my+12], 0, 180, fill=c, width=2)
+    def dom(my): draw.ellipse([110, my-6, 130, my+6], fill="#334455")
+
+    if tod == "night" and expr_idx < 5:
+        # Sleeping, no Zzz
+        dce(left_eye_x, eye_y); dce(right_eye_x, eye_y); dom(mouth_y)
+    elif expr_idx == 0:
+        dhe(left_eye_x, eye_y); dhe(right_eye_x, eye_y); dsm(mouth_y, True, "#FF6688")
+    elif expr_idx == 1:
+        dwe(left_eye_x, eye_y); dp(left_eye_x, eye_y, r=8); ds(left_eye_x, eye_y, 4, -4)
+        dce(right_eye_x, eye_y); dsm(mouth_y)
+        try: fz = ImageFont.truetype(FONT_PATH, 14)
+        except: fz = ImageFont.load_default()
+        draw.text((left_eye_x+18, eye_y-28), "✨", font=fz, fill="#FFFF00")
+    elif expr_idx == 2:
+        dwe(left_eye_x, eye_y, 30); dp(left_eye_x, eye_y, r=11, ox=2, oy=-2); ds(left_eye_x, eye_y, 6, -6, 4); ds(left_eye_x, eye_y, -6, 2, 3)
+        dwe(right_eye_x, eye_y, 30); dp(right_eye_x, eye_y, r=11, ox=2, oy=-2); ds(right_eye_x, eye_y, 6, -6, 4)
+        dsm(mouth_y, True)
+    elif expr_idx == 3:
+        dwe(left_eye_x, eye_y); dp(left_eye_x, eye_y, r=9); ds(left_eye_x, eye_y, 4, -4)
+        dwe(right_eye_x, eye_y); dp(right_eye_x, eye_y, r=9, ox=-3, oy=2); ds(right_eye_x, eye_y, -2, -4)
+        dsm(mouth_y, True, "#FFFF00")
+        try: fn = ImageFont.truetype(FONT_PATH, 16)
+        except: fn = ImageFont.load_default()
+        draw.text((150, eye_y-38), "♪", font=fn, fill="#FFFF00")
+        draw.text((45, eye_y-32), "♫", font=fn, fill="#FFAA00")
+    elif expr_idx == 4:
+        dwe(left_eye_x, eye_y, 28); dp(left_eye_x, eye_y, r=13, oy=4, c="#2244AA"); ds(left_eye_x, eye_y, 6, -2, 4)
+        dwe(right_eye_x, eye_y, 28); dp(right_eye_x, eye_y, r=13, oy=4, c="#2244AA"); ds(right_eye_x, eye_y, 6, -2, 4)
+        draw.arc([100, mouth_y+5, 140, mouth_y+20], 0, 180, fill="#8899CC", width=2)
+    elif expr_idx == 5:
+        dce(left_eye_x, eye_y); dce(right_eye_x, eye_y); dsm(mouth_y, True, "#FFDD44")
+    elif expr_idx == 6:
+        dwe(left_eye_x, eye_y-5); dp(left_eye_x, eye_y-5, oy=-2)
+        dwe(right_eye_x, eye_y+5); dp(right_eye_x, eye_y+5, ox=2, oy=2)
+        draw.ellipse([112, mouth_y-3, 128, mouth_y+6], fill="#334455")
+    elif expr_idx == 7:
+        # 👀 BIG EYES — "message lu" / surprise
+        dwe(left_eye_x, eye_y, 32); dp(left_eye_x, eye_y, r=6)
+        dwe(right_eye_x, eye_y, 32); dp(right_eye_x, eye_y, r=6)
+        draw.ellipse([108, mouth_y-12, 132, mouth_y+12], fill="#334455")
+    elif expr_idx == 8:
+        scl = "#FFDDDD" if tod == "evening" else "#FFFFFF"
+        pc = "#8B0000" if tod == "evening" else "#111122"
+        for ex in [left_eye_x, right_eye_x]:
+            de(ex, eye_y, 26, scl)
+            draw.rectangle([ex-28, eye_y-28, ex+28, eye_y-2], fill="#FFFF00")
+            dp(ex, eye_y, oy=8, r=5, c=pc)
+        draw.arc([98, mouth_y-6, 142, mouth_y+6], 0, 180, fill="#668888", width=2)
+    else:
+        dwe(left_eye_x, eye_y); dp(left_eye_x, eye_y, r=9); ds(left_eye_x, eye_y, 4, -4)
+        dwe(right_eye_x, eye_y); dp(right_eye_x, eye_y, r=9, ox=1, oy=-1); ds(right_eye_x, eye_y, 4, -5)
+        dsm(mouth_y)
+
+    return pil_to_rgb565(img)
+
+
+def render_clock_only():
+    """Simple clock display — time + date on black."""
+    from PIL import Image, ImageDraw, ImageFont
+    W, H = 240, 280
+    img = Image.new("RGB", (W, H), "#000000")
+    draw = ImageDraw.Draw(img)
+    now = datetime.now()
+    time_str = now.strftime("%H:%M")
+    date_str = now.strftime("%d/%m/%Y")
+    try:
+        ft = ImageFont.truetype(FONT_PATH, 42)
+        fd = ImageFont.truetype(FONT_PATH, 16)
+    except:
+        ft = fd = ImageFont.load_default()
+    bb = draw.textbbox((0,0), time_str, font=ft)
+    draw.text(((W-(bb[2]-bb[0]))//2, 100), time_str, font=ft, fill="#FFFFFF")
+    bb = draw.textbbox((0,0), date_str, font=fd)
+    draw.text(((W-(bb[2]-bb[0]))//2, 160), date_str, font=fd, fill="#888888")
+    return pil_to_rgb565(img)
+
+
+class AudioRecorder:
+    """Streaming recorder: sends 2s chunks to Groq Whisper, accumulates text, displays live on LCD."""
+    def __init__(self, dev="plughw:0,0", chunk_sec=2.0):
+        self.dev = dev
+        self.chunk_sec = chunk_sec
+        self.proc = None
+        self.accumulated_text = ""
+        self._running = False
+        self._stream_thread = None
+        self._on_text = None  # callback(text) for live display
+        self._last_text = ""  # anti-duplicate
+        self._raw_audio = b""  # full audio fallback
+
+    def start(self, on_text_callback):
+        """Start recording + streaming transcription. on_text_callback(text) called with accumulated text."""
+        self._on_text = on_text_callback
+        self.accumulated_text = ""
+        self._last_text = ""
+        self._raw_audio = b""
+        self._running = True
+        # arecord → pipe (16-bit mono 16kHz, raw PCM)
+        self.proc = subprocess.Popen(
+            ["arecord", "-D", self.dev, "-f", "S16_LE", "-r", str(SAMPLE_RATE),
+             "-c", "1", "-t", "raw", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid)
+        self._stream_thread = threading.Thread(target=self._stream_loop, daemon=True)
+        self._stream_thread.start()
+        return True
+
+    def _stream_loop(self):
+        """Stream audio in 2s chunks; transcribe each chunk and call _on_text live."""
+        import select, math
+        chunk_bytes = int(SAMPLE_RATE * 2 * self.chunk_sec)
+        buf = b""
+        fd = self.proc.stdout.fileno()
+        while self._running:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.3)
+                if not ready:
+                    continue
+                data = os.read(fd, min(chunk_bytes - len(buf), 8192))
+                if not data:
+                    if buf:
+                        self._process_chunk(buf)
+                    break
+                buf += data
+                self._raw_audio += data
+                if len(buf) < chunk_bytes:
+                    continue
+                self._process_chunk(buf)
+                buf = b""
+            except Exception as e:
+                print(f"[STREAM] Error: {e}")
+                break
+        print(f"[STREAM] Total audio: {len(self._raw_audio)} bytes")
+
+    def _process_chunk(self, data):
+        import math
+        if not data:
+            return
+        samples = struct.unpack(f"<{len(data)//2}h", data[:len(data)//2*2])
+        if not samples:
+            return
+        rms = math.sqrt(sum(s*s for s in samples) / len(samples))
+        if rms < 1500:
+            print(f"[STREAM] Chunk RMS={rms:.0f} < 1500 — skipped")
+            return
+        tmp = "/tmp/toth_chunk.wav"
+        self._write_wav(tmp, data)
+        txt = self._groq_transcribe(tmp)
+        if txt and txt != self._last_text:
+            self._last_text = txt
+            self.accumulated_text += (" " if self.accumulated_text else "") + txt
+            if self._on_text:
+                self._on_text(self.accumulated_text)
+            print(f"[STREAM] Live: {self.accumulated_text}")
+
+    def _write_wav(self, path, pcm_data):
+        """Write raw PCM to a minimal WAV file."""
+        with open(path, "wb") as f:
+            ds = len(pcm_data)
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", 36 + ds))
+            f.write(b"WAVE")
+            f.write(b"fmt ")
+            f.write(struct.pack("<I", 16))
+            f.write(struct.pack("<H", 1))
+            f.write(struct.pack("<H", 1))
+            f.write(struct.pack("<I", SAMPLE_RATE))
+            f.write(struct.pack("<I", SAMPLE_RATE * 2))
+            f.write(struct.pack("<H", 2))
+            f.write(struct.pack("<H", 16))
+            f.write(b"data")
+            f.write(struct.pack("<I", ds))
+            f.write(pcm_data)
+
+    def _groq_transcribe(self, path):
+        """Transcribe a single audio chunk via Groq Whisper."""
+        try:
+            with open(path, "rb") as f:
+                r = requests.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": "Bearer " + G_K},
+                    files={"file": ("chunk.wav", f, "audio/wav")},
+                    data={"model": "whisper-large-v3", "language": "fr", "response_format": "json", "prompt": _WHISPER_PROMPT, "temperature": "0.0"},
+                    timeout=60)
+            if r.status_code == 200:
+                t = r.json().get("text", "").strip()
+                return t if t else ""
+        except Exception as e:
+            print(f"[GROQ] Chunk error: {e}")
+        return ""
+
+    def stop(self):
+        """Stop recording and return accumulated text."""
+        self._running = False
+        if self.proc:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+        if self._stream_thread and self._stream_thread.is_alive():
+            self._stream_thread.join(timeout=5)
+        # Fallback si rien n'a été transcrit en live
+        if not self.accumulated_text and self._raw_audio:
+            print("[STREAM] Fallback transcription globale")
+            tmp = "/tmp/toth_full.wav"
+            self._write_wav(tmp, self._raw_audio)
+            self.accumulated_text = self._groq_transcribe(tmp)
+        return self.accumulated_text.strip()
+
+def transcribe(path):
+    if not os.path.exists(path):
+        print(f"[ASR] File not found: {path}")
+        return None
+    fsize = os.path.getsize(path)
+    print(f"[ASR] Transcribing {fsize} bytes via Groq...")
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": "Bearer " + G_K},
+                files={"file": ("audio.wav", f, "audio/wav")},
+                data={"model": "whisper-large-v3", "language": "fr", "response_format": "json", "prompt": _WHISPER_PROMPT, "temperature": "0.0"},
+                timeout=60)
+        print(f"[ASR] HTTP {r.status_code}")
+        if r.status_code == 200:
+            t = r.json().get("text", "").strip()
+            print(f"[ASR] Result: {t[:80]}")
+            return t if t else None
+        else:
+            print(f"[ASR] Error: {r.text[:200]}")
+    except Exception as e:
+        print(f"[ASR] Exception: {e}")
+    return None
+
+def clean_for_tts(text):
+    """Nettoie le markdown et la ponctuation excessive pour le TTS vocal.
+    edge-tts lit tout littéralement — **gras** devient 'astérisque astérisque gras astérisque astérisque'."""
+    import re
+    # Liens markdown [texte](url) → texte
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    # Gras **texte** ou __texte__
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    # Italique *texte* ou _texte_ (attention aux astérisques isolés)
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    text = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', text)
+    # Headers # ## ###
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Listes - * •
+    text = re.sub(r'^[\s]*[-*•]\s+', '• ', text, flags=re.MULTILINE)
+    # Backticks `code` et ```blocks```
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Sauts de ligne multiples → un seul
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    # Espaces multiples
+    text = re.sub(r' {2,}', ' ', text)
+    # Strikethrough ~~texte~~
+    text = re.sub(r'~~([^~]+)~~', r'\1', text)
+    # Emojis custom :name:
+    text = re.sub(r':[a-z_]+:', '', text)
+    return text.strip()
+
+def speak(text, cancel_check=None, display_cb=None):
+    """Prononce un texte phrase par phrase. Coupe la radio si elle joue.
+    Chaque phrase = un MP3 séparé → évite les crashs OOM/edge-tts sur les longs textes.
+    display_cb(full_text, batch_idx, total_batches) appelé avant chaque phrase pour le scroll LCD.
+    Returns False if cancelled mid-speech."""
+    global RADIO_WAS_PLAYING
+    if not text:
+        return False
+
+    global _TTS_PROC
+    _TTS_PROC = None
+    import asyncio, re
+
+    # Split into sentences: split after .!?» followed by whitespace
+    sentences = re.split(r'(?<=[.!?»])\s+', text)
+    # Merge back tiny fragments (e.g. "M." or "Dr." got split)
+    merged = []
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if merged and len(merged[-1]) < 8 and merged[-1][-1] not in '.!?»':
+            merged[-1] = merged[-1] + " " + s
+        else:
+            merged.append(s)
+    sentences = merged
+
+    # 1. Stop radio if playing (once, not per sentence)
+    radio_was_on = os.path.exists(radio_mod.PID_FILE)
+    if radio_was_on:
+        state_file = "/tmp/toth_radio_state"
+        if os.path.exists(state_file):
+            with open(state_file) as f:
+                RADIO_WAS_PLAYING = f.read().strip()
+            print(f"[TTS] Radio {RADIO_WAS_PLAYING} playing — pausing...")
+        radio_mod.stop_radio()
+        time.sleep(0.5)
+
+    # Group sentences into batches of ~4, synthesized as ONE MP3 per batch
+    BATCH_SIZE = 3  # 3 phrases par batch → moins de pauses entre les groupes
+    batches = [sentences[i:i+BATCH_SIZE] for i in range(0, len(sentences), BATCH_SIZE)]
+
+    print(f"[TTS] Speaking {len(sentences)} sentences → {len(batches)} batch(es): {text[:80]}...")
+
+    # Route PulseAudio to AirPods once
+    airpods_sink = "bluez_output.E4_90_FD_E3_4A_D3.1"
+    try:
+        subprocess.run(
+            ["pactl", "set-default-sink", airpods_sink],
+            timeout=3, capture_output=True
+        )
+    except Exception:
+        pass
+
+    # Device fallback: pulse → hw:0,0 → default (found once, reused)
+    devices = [
+        ("pulse", "PulseAudio (AirPods)"),
+        ("default", "WM8960 speaker"),
+        ("default", "ALSA default"),
+    ]
+    play_dev = "default"
+    for dev, label in devices:
+        try:
+            test = subprocess.run(
+                ["mpg123", "-t", "-q", "-a", dev],
+                timeout=3, capture_output=True
+            )
+            play_dev = dev
+            print(f"[TTS] Device: {label}")
+            break
+        except Exception:
+            continue
+
+    played_any = False
+    for batch_idx, batch in enumerate(batches):
+        # Check cancel flag between batches
+        if cancel_check and cancel_check():
+            print(f"[TTS] Cancelled before batch {batch_idx+1}")
+            break
+
+        batch_text = ". ".join(s.strip() for s in batch if s.strip()) + "."
+
+        tmp = f"/tmp/toth_speech_b{batch_idx}.mp3"
+
+        try:
+            # Synthesize entire batch as one MP3
+            async def synthesize():
+                c = Communicate(batch_text, "fr-FR-RemyMultilingualNeural")
+                with open(tmp, "wb") as f:
+                    async for ch in c.stream():
+                        if ch["type"] == "audio":
+                            f.write(ch["data"])
+            asyncio.run(synthesize())
+
+            # Measure MP3 duration for scroll speed
+            duration = 0
+            try:
+                import json
+                r = subprocess.run(
+                    ["ffprobe", "-v", "quiet", "-print_format", "json",
+                     "-show_format", tmp],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    info = json.loads(r.stdout)
+                    duration = float(info.get("format", {}).get("duration", 0))
+            except Exception:
+                pass
+            if duration <= 0:
+                # Fallback: estimate from char count (~13 chars/sec French TTS)
+                duration = max(1.0, len(batch_text) / 13.0)
+
+            # Update LCD scroll with actual duration BEFORE playing
+            if display_cb:
+                try:
+                    display_cb(text, batch_idx, len(batches), duration)
+                except Exception as e:
+                    print(f"[TTS] display_cb error: {e}")
+
+            # Convert MP3 to WAV (ALSA direct playback is more reliable)
+            wav_tmp = tmp.replace(".mp3", ".wav")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", tmp, "-ar", "44100", "-ac", "2", wav_tmp],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=15
+            )
+            # Max volume pour TTS (Rémy entend mal sinon)
+            os.popen("amixer -c 0 set Speaker 127")
+            # Play WAV via aplay direct to WM8960 (bypass PulseAudio)
+            _TTS_PROC = subprocess.Popen(
+                ["aplay", "-q", "-D", "plughw:0,0", wav_tmp],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid
+            )
+            rc = _TTS_PROC.wait(timeout=120)
+            if rc == 0:
+                played_any = True
+            elif rc == -15:
+                print(f"[TTS] Batch {batch_idx+1} cancelled")
+                _TTS_PROC = None
+                return False
+            else:
+                print(f"[TTS] Batch {batch_idx+1} failed (rc={rc})")
+        except subprocess.TimeoutExpired:
+            print(f"[TTS] Batch {batch_idx+1} timed out")
+            try:
+                if _TTS_PROC and _TTS_PROC.poll() is None:
+                    os.killpg(os.getpgid(_TTS_PROC.pid), signal.SIGTERM)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[TTS] Batch {batch_idx+1} error: {e}")
+
+    _TTS_PROC = None
+
+    # 3. Resume radio if it was playing
+    if RADIO_WAS_PLAYING:
+        print(f"[TTS] Resuming radio: {RADIO_WAS_PLAYING}")
+        radio_mod.play_radio(RADIO_WAS_PLAYING)
+        RADIO_WAS_PLAYING = None
+    else:
+        # Retour volume 30% apres parole (anti-Larsen)
+        os.popen("amixer -c 0 set Speaker 38")
+
+    if played_any:
+        print("[TTS] All sentences played")
+        return True
+    else:
+        print("[TTS] No sentences played")
+        return False
+
+SHARED_SESSION_FILE = "/tmp/toth_shared_session"
+
+QUEUE_STATUS_FILE = "/tmp/toth_queue_status"
+
+def _get_recent_context(session_id, max_messages=5):
+    """Read the last N user+assistant messages from the Hermes session DB
+    and return them as a compact context string (or empty string if none)."""
+    try:
+        import sqlite3
+        db = sqlite3.connect(os.path.expanduser("~/.hermes/state.db"))
+        rows = db.execute('''
+            SELECT role, content FROM messages
+            WHERE session_id=? AND role IN ('user','assistant')
+            ORDER BY id DESC LIMIT ?
+        ''', (session_id, max_messages)).fetchall()
+        db.close()
+        if not rows:
+            return ""
+        lines = []
+        for role, content in reversed(rows):
+            if not content:
+                continue
+            # Keep it compact: strip long messages to ~300 chars
+            short = content.strip()[:300]
+            label = "Rémy" if role == "user" else "Hermes"
+            lines.append(f"{label}: {short}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[CTX] Failed to read session DB: {e}")
+        return ""
+
+def hermes_ask(question, timeout=120, extra_instruction=None):
+    """Send question to Hermes via the LOCAL HTTP API (fast, no CLI startup).
+    
+    Reads /tmp/toth_shared_session for the active Telegram session ID,
+    pulls the 5 most recent user+assistant messages from the session DB,
+    and injects them into a lightweight one-shot prompt sent to the
+    Hermes API server already running on http://49.13.237.85:8080.
+    
+    MUCH faster than hermes chat -q (no Python + openai import overhead).
+    
+    Returns (answer, sid) tuple on success, (None, None) on failure."""
+    import json as _json
+    try:
+        # Read Telegram session ID
+        session_id = None
+        try:
+            with open("/tmp/toth_shared_session", "r") as f:
+                session_id = f.read().strip()
+        except Exception:
+            pass
+        
+        # Build prompt with recent context
+        context = ""
+        if session_id:
+            context = _get_recent_context(session_id)
+        
+        # Read Hermes sync brief (pushed by Hermes after each decision)
+        sync_brief = ""
+        try:
+            with open("/tmp/toth_context_brief", "r") as f:
+                sync_brief = f.read().strip()
+        except Exception:
+            pass
+        
+        # Read Toth's persistent memory (identity, capabilities, state)
+        toth_memory = ""
+        try:
+            with open("/home/pi/toth/memory.md", "r") as f:
+                toth_memory = f.read().strip()
+        except Exception:
+            pass
+        
+        if context:
+            brief_block = f"\n\n⚠️ Contexte ACTUEL (donné par Hermes, prioritaire sur l'historique) :\n{sync_brief}" if sync_brief else ""
+            memory_block = f"\n\n📋 MA MÉMOIRE PERMANENTE (mon identité, mes capacités, mon état) :\n{toth_memory}" if toth_memory else ""
+            extra_block = f"\n\n🎵 INSTRUCTION SPÉCIALE :\n{extra_instruction}" if extra_instruction else ""
+            full_prompt = (
+                "Contexte récent de la conversation Telegram:\n"
+                f"{context}"
+                f"{brief_block}"
+                f"{memory_block}"
+                f"{extra_block}\n\n"
+                f"Rémy te parle via Toth (assistant vocal). Réponds en français, "
+                f"de façon naturelle et concise (2-4 phrases max).\n\n"
+                f"🏴‍☠️ Rémy 🏴‍☠️: {question}"
+            )
+        else:
+            brief_block = f"\n\n⚠️ Contexte ACTUEL (donné par Hermes, prioritaire) :\n{sync_brief}\n" if sync_brief else ""
+            memory_block = f"\n\n📋 MA MÉMOIRE PERMANENTE (mon identité, mes capacités, mon état) :\n{toth_memory}" if toth_memory else ""
+            extra_block = f"\n\n🎵 INSTRUCTION SPÉCIALE :\n{extra_instruction}\n" if extra_instruction else ""
+            full_prompt = (
+                f"{brief_block}"
+                f"{memory_block}"
+                f"{extra_block}"
+                f"Rémy te parle via Toth (assistant vocal). Réponds en français, "
+                f"de façon naturelle et concise (2-4 phrases max).\n\n"
+                f"🏴‍☠️ Rémy 🏴‍☠️: {question}"
+            )
+        
+        # Use the LOCAL Hermes API (already running, no startup cost)
+        api_url = "http://49.13.237.85:8080/v1/chat/completions"
+        payload = _json.dumps({
+            "model": "hermes",
+            "messages": [{"role": "user", "content": full_prompt}],
+            "max_tokens": 500,
+            "temperature": 0.7,
+            "session_id": "toth-direct"
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(
+            api_url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {HERMES_KEY}",
+            },
+            method="POST",
+        )
+        
+        print(f"[API] POST {api_url} (5-msg context, session={session_id or 'NONE'}, timeout={timeout}s)...")
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+        dt = time.time() - t0
+        
+        data = _json.loads(body)
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"[API] Got response in {dt:.1f}s ({len(answer)} chars)")
+        
+        if answer.strip():
+            return (answer.strip(), None)
+        else:
+            print(f"[API] Empty response: {body[:300]}")
+    except Exception as e:
+        print(f"[API] Failed: {e}")
+    return (None, None)
+
+class TothChatbot:
+    def __init__(self):
+        self.state = STATE_IDLE
+        self.board = None; self.rec = None
+        self.lock = threading.Lock()
+        self._display_lock = threading.Lock()  # Serialize LCD draws (prevents SPI conflicts)
+        self._btn_held = False  # True while button is physically down (blocks live transcription updates)
+        self._clock_running = False  # Robot clock thread flag
+        self._clock_thread = None
+        self._batt_timer = None
+        self._cancel_flag = False    # Big red button: cancel anything in progress
+        self._pending_question = None  # Saved question for retry (if Hermes timed out)
+        self._pending_since = 0        # When the pending question was saved
+        self._btn_dead_until = time.time() + 3  # 30s startup cooldown (prevents ghost presses)
+        self._radio_station_idx = 0
+        self._radio_proc = None
+        self._radio_playing = False
+        self._radio_fade_lock = threading.Lock()
+        self._radio_volume = 127  # 100% ALSA scale
+        self._volume_pct = 100       # Display percentage (steps of 5)
+        # ── Constantes système (thread d'arrière-plan) ──
+        self._const_ram_total = "?"
+        self._const_ram_used = "?"
+        self._const_swap_total = "?"
+        self._const_swap_used = "?"
+        self._const_temp = "?"
+        self._const_load = "?"
+        self._const_disk_used = "?"
+        self._const_disk_pct = "?"
+        threading.Thread(target=self._const_update_loop, daemon=True).start()
+
+        self._param_tabs = ["SON", "VIE", "NET", "BT", "BOOT", "SSH"]
+        self._param_son_adjusting = False  # True = up/down règle volume SON
+        self._param_tunnel_confirm = False
+        # ---- Missive ----
+        self._missive_history = []   # [{"role":"user","text":"..."},{"role":"v4","text":"..."}]
+        self._missive_state = "idle"   # idle → recording → preview → sending → idle
+        self._missive_preview = ""
+        # ---- Bluetooth ----
+        self._bt_devices = []        # liste de dicts {mac, name, paired, connected}
+        self._bt_selected_idx = 0
+        self._bt_scanning = False
+        self._bt_submenu = False       # True = liste des devices trouves
+        self._bt_inside = False          # True = dans les 4 options BT
+
+        self._bt_idx = 0                   # Curseur 4 options BT
+        self._bt_last_scan = 0
+        self._param_vie_confirm = False  # True = affiche "RAFRAICHI"
+        # Preload net info
+        try:
+            self._net_hostname = subprocess.check_output(["hostname"]).decode().strip()
+        except: self._net_hostname = "?"
+        try:
+            ips = subprocess.check_output(["hostname","-I"]).decode().strip().split()
+            self._net_local_ip = ips[0] if ips else "?"
+        except: self._net_local_ip = "?"
+        try:
+            self._net_tailscale_ip = subprocess.check_output(["tailscale","ip","-4"]).decode().strip().split()[0]
+        except: self._net_tailscale_ip = "?"
+        try:
+            ssid = subprocess.check_output(["iwgetid","-r"]).decode().strip()
+            self._net_wifi_ssid = ssid if ssid else "?"
+        except: self._net_wifi_ssid = "?"
+        self._net_tailscale_on = False
+        self._param_submenu_idx = 0
+        self._boot_options = ["REBOOT", "GATEWAY", "SERVICE", "ETEINDRE"]
+        self._boot_idx = 0
+        self._boot_submenu = False
+        self._param_inside_submenu = False
+        # ── Book reader state ──
+        self._books = []                 # [{title, author, file}]
+        self._book_idx = 0               # selected book index
+        self._book_chapter_idx = 0       # selected chapter
+        self._book_char_pos = 0          # TTS reading position (chars)
+        self._book_mode = "menu"         # "menu" | "book" | "chapters"
+        self._book_is_playing = False
+        self._book_proc = None
+        self._book_fade_lock = threading.Lock()
+        self._book_last_text = ""
+        self._books_saved = "/home/pi/toth/books_state.json"
+        self._books_dir = "/home/pi/toth/books"
+        os.makedirs(self._books_dir, exist_ok=True)
+        self._load_books()
+        self._param_inside_submenu = False
+        self._volume_saved = "/home/pi/toth/volume_state.json"
+        try:
+            if os.path.exists(self._volume_saved):
+                with open(self._volume_saved, "r") as fvol:
+                    vs = json.load(fvol)
+                self._volume_pct = vs.get("pct", 100)
+                self._radio_volume = int(127 * self._volume_pct / 100)
+            else:
+                self._volume_pct = 100
+                self._radio_volume = 127
+        except Exception:
+            self._volume_pct = 100
+            self._radio_volume = 127
+        os.popen(f"pactl set-sink-volume @DEFAULT_SINK@ {self._volume_pct}%")
+        # Clean up stale watchdog files from previous runs
+        for stale in ["/tmp/toth_waiting_since"]:
+            try: os.remove(stale)
+            except Exception: pass
+        print("[TOTH] Initializing WhisplayBoard...")
+        self.board = WhisplayBoard()
+        self.board.set_backlight(100)
+        self.board.on_button_press(self._btn_press)
+        self.board.on_button_release(self._btn_release)
+        # -- Veille ecran --
+        self._last_activity = time.time()
+        self._screen_dimmed = False
+        self._idle_timeout = 9999999  # effectively disable screen dimming
+        threading.Thread(target=self._screen_idle_watcher, daemon=True).start()
+        # Start robot clock immediately, no Thoth image
+        self._show_menu(0)
+        self._start_clock()
+        # Start display override file watcher (external messages → LCD)
+        self._override_file = "/tmp/toth_display_override.txt"
+        self._override_mtime = 0
+        self._override_thread = threading.Thread(target=self._watch_override_file, daemon=True)
+        self._override_thread.start()
+        # Ring watcher: JX‑05 Bluetooth ring — middle button = record only
+        self._ring_dev = self._find_ring_device()
+        self._ring_thread = threading.Thread(target=self._ring_watcher, daemon=True)
+        self._ring_thread.start()
+        # -- Musique --
+        self._music_volume = 100
+        self._music_search_mode = False
+        # -- Media tabs --
+        self._media_tabs = ["ZIK", "RADIO", "LIVRE"]
+        self._media_idx = 0
+        self._media_inside = False
+        self._media_music_sel = 0  # 0=Rechercher, 1=Mes playlists, 2=Recent, 3=Lecture
+        self._media_music_controls = ["Précédent", "Play/Pause", "Suivant", "Stop"]
+        self._media_music_control_idx = 0
+        self._media_music_results = []  # résultats Spotify en cours
+        self._media_music_result_idx = 0
+        self._media_music_results_menu = False
+        self._media_music_playlists = []   # playlists utilisateur Spotify
+        self._media_music_playlist_idx = 0
+        self._media_music_playlist_menu = False
+        self._media_music_recent = []      # albums/artistes récemment écoutés
+        self._media_music_recent_idx = 0
+        self._media_music_recent_menu = False
+        # Pont Telegram pour bénéficier des skills Hermes (Spotify, etc.)
+        self._telegram_queue = queue.Queue()
+        if TothTelegramBridge:
+            self._bridge = TothTelegramBridge(on_reply=self._on_telegram_reply)
+            self._bridge.start()
+        else:
+            self._bridge = None
+        print("[TOTH] Ready. Hermes direct mode.")
+
+    def _wake_screen(self):
+        self._last_activity = time.time()
+        if self._screen_dimmed:
+            try:
+                # GPIO LOW = ON, puis recrée PWM à 100%
+                self.board._gpio_output(self.board.LED_PIN, 0)
+                self.board.backlight_pwm = None
+                self.board.set_backlight(100)
+                self._screen_dimmed = False
+                print("[SCREEN] Wake")
+            except Exception as e:
+                print(f"[SCREEN] Wake error: {e}")
+
+    def _rgb(self, r, g, b):
+        try: self.board.set_rgb(r, g, b)
+        except Exception: pass
+
+    def _screen_idle_watcher(self):
+        while True:
+            time.sleep(2)
+            try:
+                if time.time() - self._last_activity > self._idle_timeout and not self._screen_dimmed:
+                    # Stop PWM + GPIO HIGH = OFF
+                    if self.board.backlight_pwm:
+                        self.board.backlight_pwm.stop()
+                        self.board.backlight_pwm = None
+                    self.board._gpio_output(self.board.LED_PIN, 1)
+                    self._screen_dimmed = True
+                    print("[SCREEN] Dimmed (idle)")
+            except Exception as e:
+                print(f"[SCREEN] Watcher error: {e}")
+
+    def _clear(self):
+        """Efface complètement l'écran LCD (image noire) et réveille le rétroéclairage."""
+        self._wake_screen()
+        try:
+            img = Image.new("RGB", (240, 280), "#000000")
+            data = pil_to_rgb565(img)
+            with self._display_lock:
+                self.board.draw_image(0, 0, 240, 280, data)
+        except Exception as e:
+            print(f"[CLEAR] {e}")
+
+    def _disp(self, text, fs=22):
+        """Display text on purple background, yellow text. Font size 22 default."""
+        self._wake_screen()
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            img = Image.new("RGB", (240, 280), "#000000")
+            draw = ImageDraw.Draw(img)
+            try:
+                font = ImageFont.truetype(FONT_PATH, fs)
+            except:
+                font = ImageFont.load_default()
+            words = text.split()
+            lines = []; cur = ""
+            for w in words:
+                t = (cur + " " + w).strip()
+                b = draw.textbbox((0, 0), t, font=font)
+                if (b[2] - b[0]) > 224:
+                    if cur: lines.append(cur)
+                    cur = w
+                else:
+                    cur = t
+            if cur: lines.append(cur)
+            y = 8
+            for line in lines[:12]:
+                draw.text((8, y), line, font=font, fill="#FFFF00")
+                y += fs + 2
+            data = pil_to_rgb565(img)
+            with self._display_lock:
+                self.board.draw_image(0, 0, 240, 280, data)
+        except Exception as e:
+            print(f"[DISP] {e}")
+
+    def _watch_override_file(self):
+        """Watch /tmp/toth_display_override.txt — when modified, display its content for 8 seconds."""
+        import time
+        while True:
+            try:
+                if os.path.exists(self._override_file):
+                    mtime = os.path.getmtime(self._override_file)
+                    if mtime > self._override_mtime:
+                        self._override_mtime = mtime
+                        with open(self._override_file, "r") as f:
+                            msg = f.read().strip()
+                        if msg:
+                            print(f"[OVERRIDE] Displaying: {msg[:60]}")
+                            self._disp(msg, fs=22)
+            except Exception as e:
+                print(f"[OVERRIDE] Error: {e}")
+            time.sleep(0.5)
+
+    def _disp_scroll(self, full_text, batch_idx, total_batches, duration=None):
+        """Smooth scroll: white bg, black text, font 22. Scrolls text upward during TTS playback."""
+        import re
+        if duration is None:
+            duration = 5.0  # default if no MP3 duration available
+        print(f"[DISP-SCROLL] batch={batch_idx}/{total_batches}, duration={duration:.1f}s, text_len={len(full_text)}")
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            FONT_SIZE = 22
+            font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
+            line_h = FONT_SIZE + 4
+            screen_h = 280
+
+            # Split into sentences (same logic as speak())
+            sentences = re.split(r'(?<=[.!?»])\s+', full_text)
+            merged = []
+            for s in sentences:
+                s = s.strip()
+                if not s:
+                    continue
+                if merged and len(merged[-1]) < 8 and merged[-1][-1] not in '.!?»':
+                    merged[-1] = merged[-1] + " " + s
+                else:
+                    merged.append(s)
+            sentences = merged
+
+            # Get current batch sentences (BATCH_SIZE=3, same as speak())
+            BATCH_SIZE = 3
+            start_s = batch_idx * BATCH_SIZE
+            end_s = min(start_s + BATCH_SIZE, len(sentences))
+            batch_sentences = sentences[start_s:end_s]
+            batch_text = " ".join(batch_sentences)
+
+            # Word-wrap
+            words = batch_text.split()
+            lines = []
+            cur = ""
+            for w in words:
+                t = (cur + " " + w).strip() if cur else w
+                b = font.getbbox(t)
+                if (b[2] - b[0]) > 224:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+                else:
+                    cur = t
+            if cur:
+                lines.append(cur)
+
+            total_text_h = len(lines) * line_h + 16  # top+bottom padding
+
+            # If text fits on screen, just show it static — no scroll needed
+            if total_text_h <= screen_h:
+                img = Image.new("RGB", (240, screen_h), "#000000")
+                draw = ImageDraw.Draw(img)
+                y = (screen_h - total_text_h) // 2 + 8
+                for line in lines:
+                    draw.text((8, y), line, font=font, fill="#FFFF00")
+                    y += line_h
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, screen_h, pil_to_rgb565(img))
+                return
+
+            # Scroll animation — smooth upward at ~50 px/sec
+            scroll_speed = 100.0  # px/sec (2x accéléré)
+            total_scroll = total_text_h - screen_h + 20
+            anim_duration = min(duration, total_scroll / scroll_speed)
+            fps = 12
+            step = total_scroll / max(1, anim_duration * fps)
+            frame_time = 1.0 / fps
+
+            print(f"[SCROLL] lines={len(lines)}, total_h={total_text_h}, scroll={total_scroll:.0f}px, "
+                  f"anim={anim_duration:.1f}s, fps={fps}, step={step:.1f}px")
+
+            # Stop any previous scroll
+            self._scroll_running = False
+            time.sleep(0.05)
+
+            self._scroll_running = True
+            def animate():
+                scroll_y = 0.0
+                last_frame = None
+                while self._scroll_running and scroll_y < total_scroll:
+                    try:
+                        img = Image.new("RGB", (240, screen_h), "#000000")
+                        draw = ImageDraw.Draw(img)
+                        y = 8 - scroll_y
+                        for line in lines:
+                            if -line_h < y < screen_h:
+                                draw.text((8, y), line, font=font, fill="#FFFF00")
+                            y += line_h
+
+                        # Only push frame if different (SPI is slow on Pi Zero)
+                        data = pil_to_rgb565(img)
+                        if data != last_frame:
+                            with self._display_lock:
+                                self.board.draw_image(0, 0, 240, screen_h, data)
+                            last_frame = data
+
+                        scroll_y += step
+                        time.sleep(frame_time)
+                    except Exception as e:
+                        print(f"[SCROLL] Frame error: {e}")
+                        break
+                # Final frame: show last lines
+                try:
+                    img = Image.new("RGB", (240, screen_h), "#000000")
+                    draw = ImageDraw.Draw(img)
+                    y = screen_h - (len(lines) * line_h) - 8
+                    for line in lines:
+                        draw.text((8, y), line, font=font, fill="#FFFF00")
+                        y += line_h
+                    with self._display_lock:
+                        self.board.draw_image(0, 0, 240, screen_h, pil_to_rgb565(img))
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=animate, daemon=True)
+            t.start()
+
+        except Exception as e:
+            print(f"[DISP-SCROLL] Error: {e} — fallback")
+            try:
+                self._disp(full_text[:200], 22)
+            except Exception:
+                pass
+
+    def _stop_scroll(self):
+        """Stop the smooth scroll animation thread."""
+        self._scroll_running = False
+
+    def _start_clock(self):
+        """Affiche l'image d'idle statique - visage robot desactive."""
+        if self._clock_running:
+            return
+        self._clock_running = True
+        self._rgb(0, 0, 0)
+        def loop():
+            try:
+                if os.path.exists(IDLE_IMAGE):
+                    with open(IDLE_IMAGE, "rb") as f:
+                        raw = f.read()
+                    raw = overlay_battery_on_raw(raw)
+                    with self._display_lock:
+                        self.board.draw_image(0, 0, 240, 280, raw)
+                    print("[IDLE] Image idle affichee")
+                else:
+                    self._clear()
+            except Exception as e:
+                print(f"[IDLE] Erreur affichage idle: {e}")
+            while self._clock_running:
+                time.sleep(1)
+        self._clock_thread = threading.Thread(target=loop, daemon=True)
+        self._clock_thread.start()
+        self._batt_timer = threading.Timer(900, self._send_battery_telegram)
+        self._batt_timer.daemon = True
+        self._batt_timer.start()
+
+    def _stop_clock(self):
+        self._clock_running = False
+        if self._batt_timer:
+            self._batt_timer.cancel()
+            self._batt_timer = None
+
+    def _btn_press(self):
+        """Button pressed — record time for long-press detection, show feedback."""
+        self._wake_screen()
+        print(f"[BTN] ⬇️  PRESS at {time.time():.1f}")
+        self._press_start = time.time()
+        self._btn_held = True  # Block live transcription from overwriting hold message
+        with self.lock: s = self.state
+        if s == STATE_IDLE:
+            pass  # No message
+        elif s == STATE_RECORD:
+            threading.Thread(target=self._cancel_after_3s, daemon=True).start()
+
+    def _btn_release(self):
+        """Button released — short press = normal, 3-10s = soft reset, ≥10s = hard restart."""
+        self._wake_screen()
+        print(f"[BTN] ⬆️  RELEASE at {time.time():.1f}")
+        if not hasattr(self, '_press_start'):
+            return
+        global _TTS_PROC
+        held = time.time() - self._press_start
+        del self._press_start
+        self._btn_held = False  # Allow display updates again
+
+        # If recording and held >= 3s = cancel recording
+        if self.state == STATE_RECORD and held >= 3.0:
+            print(f"[BTN] 3s HOLD — CANCELLING RECORDING")
+            self._cancel_record_timeout()
+            if self.rec:
+                self.rec.stop()
+                self.rec = None
+            self._idle()
+            return
+        # If question displayed and held >= 3s = cancel sending
+        if self.state in (STATE_PROCESS, STATE_WAITING) and held >= 3.0:
+            print(f"[BTN] 3s HOLD — CANCELLING SEND")
+            self._cancel_flag = True
+            self._idle()
+            return
+
+
+        if held >= 10.0:
+            # VERY LONG PRESS — hard restart via systemd (force-kill if stuck)
+            print(f"[BTN] 🔨 HARD RESET ({held:.1f}s) — restarting toth.service")
+            self._disp("🔨 REBOOT\nSERVICE...")
+            self._cancel_flag = True
+            if _TTS_PROC and _TTS_PROC.poll() is None:
+                try:
+                    os.killpg(os.getpgid(_TTS_PROC.pid), signal.SIGTERM)
+                except Exception:
+                    pass
+            # Clean up state so next start is fresh
+            self._pending_question = None
+            try: os.remove("/tmp/toth_shared_session")
+            except Exception: pass
+            try: os.remove("/tmp/toth_waiting_since")
+            except Exception: pass
+            # Context brief preserved for Hermes bridge (7 June 2026 fix)
+            pass
+            sys.exit(0)
+            return
+
+        # SHORT PRESS — normal behavior (debounce + state machine)
+        self._btn_short_press()
+
+    def _btn_short_press(self):
+        global _TTS_PROC
+        # Debounce: ignore button presses during cooldown, except when recording (stop is always allowed)
+        now = time.time()
+        if hasattr(self, '_btn_dead_until') and now < self._btn_dead_until and self.state != STATE_RECORD:
+            return
+        print(f"[BTN] Press detected, state={self.state}")
+        with self.lock: s = self.state
+        # Block subsequent presses: 5s cooldown from idle (prevents runaway loops), 0.5s otherwise
+        cooldown = 2.0 if s == STATE_IDLE else 0.5
+        self._btn_dead_until = now + cooldown
+        if s == STATE_IDLE:
+            # Si on est dans l'onglet ZIK de MEDIA et qu'on a selectionne "Rechercher", bouton = recherche Spotify
+            if (self._menu_items[self._menu_idx] == "MEDIA" and
+                getattr(self, '_media_inside', False) and
+                self._media_tabs[self._media_idx % len(self._media_tabs)] == "ZIK" and
+                self._media_music_sel == 0):
+                self._music_search_mode = True
+                self._record(music=True)
+            else:
+                self._record()
+        elif s == STATE_RECORD:
+            self._process()
+        else:
+            # CANCEL ANYTHING — TTS, processing, waiting, everything
+            print(f"[BTN] 🔴 CANCEL pressed during state={s} — killing everything")
+            self._cancel_flag = True
+            # Kill TTS process if running
+            if _TTS_PROC and _TTS_PROC.poll() is None:
+                try:
+                    os.killpg(os.getpgid(_TTS_PROC.pid), signal.SIGTERM)
+                    _TTS_PROC.wait(timeout=2)
+                    print("[BTN] TTS killed")
+                except Exception as e:
+                    print(f"[BTN] Kill TTS error: {e}")
+                    try:
+                        _TTS_PROC.kill()
+                    except Exception:
+                        pass
+                _TTS_PROC = None
+            # Reset pending question
+            self._pending_question = None
+            self._asking = False
+            print("[BTN] Pending cleared")
+            # Go back to idle
+            self._idle()
+
+    def _on_live_text(self, text):
+        """Callback from AudioRecorder — display live transcription."""
+        if self.state != STATE_RECORD:
+            return
+        if self._btn_held:
+            return
+        self._disp(text[:80])
+
+    def _record(self, music=False):
+        global RADIO_WAS_PLAYING
+        print("[REC] Starting recording...")
+        open("/tmp/toth_recording", "w").close()  # anti-larsen
+        self._stop_clock()
+        # Stop radio if playing, remember which one to resume later
+        radio_was_on = os.path.exists(radio_mod.PID_FILE)
+        if radio_was_on:
+            state_file = "/tmp/toth_radio_state"
+            if os.path.exists(state_file):
+                with open(state_file) as f:
+                    RADIO_WAS_PLAYING = f.read().strip()
+                print(f"[REC] Radio {RADIO_WAS_PLAYING} playing — stopping for recording...")
+            radio_mod.stop_radio()
+            time.sleep(0.3)
+        with self.lock: self.state = STATE_RECORD
+        if music:
+            self._disp("🎤 Parlez...", 22)
+        else:
+            self._disp("🎤 Parlez...")
+        # Baisser gain micro pour reduire bruit ambiant TV/Spotify
+        try:
+            os.popen("amixer -c 0 sset Capture 60%")
+        except Exception as e:
+            print(f"[REC] amixer error: {e}")
+        self.rec = AudioRecorder()
+        self._record_timeout = threading.Timer(MAX_RECORD_SEC, self._record_timeout_cb)
+        self._record_timeout.start()
+        if not self.rec.start(self._on_live_text):
+            self._cancel_record_timeout()
+            try:
+                os.remove("/tmp/toth_recording")
+            except OSError:
+                pass
+
+
+    def _cancel_record_timeout(self):
+        """Annule le timer d'annulation automatique."""
+        if hasattr(self, '_record_timeout') and self._record_timeout:
+            self._record_timeout.cancel()
+            self._record_timeout = None
+
+    def _record_timeout_cb(self):
+        """Annulation automatique après MAX_RECORD_SEC sans validation."""
+        print("[REC] Timeout — annulation automatique")
+        self._btn_held = False
+        try: os.remove("/tmp/toth_recording")
+        except OSError: pass
+        self._cancel_record_timeout()
+        if self.rec:
+            self.rec.stop()
+            self.rec = None
+        self._idle()  # retour au visage
+
+    def _cancel_after_3s(self):
+        """Wait 3s — cancel recording if still pressed. Runs in a thread."""
+        start = time.time()
+        while time.time() - start < 3.0:
+            time.sleep(0.2)
+            if not self._btn_held:
+                return  # Released before 3s
+        # 3s elapsed, still held — cancel
+        print("[BTN] 3s HOLD — CANCELLING")
+        try: os.remove("/tmp/toth_recording")
+        except OSError: pass  # anti-larsen
+        self._btn_held = False
+        self._cancel_record_timeout()
+        if self.rec:
+            self.rec.stop()
+            self.rec = None
+        self._idle()
+
+    def _process(self):
+        print("[PROC] Stopping recording...")
+        self._cancel_record_timeout()
+        try: os.remove("/tmp/toth_recording")
+        except OSError: pass
+        self._btn_held = False
+        with self.lock: self.state = STATE_PROCESS
+        q = ""
+        if self.rec:
+            q = self.rec.stop(); self.rec = None
+        if not q:
+            self._disp("Pas compris.\nRéessayez.")
+            threading.Timer(5.0, lambda: self._show_menu(self._menu_idx)).start(); return
+        # Détection commande musicale
+        q_lower = q.lower().strip()
+        music_keywords = ("mets", "joue", "lance", "chanson", "musique", "spotify", "album", "titre", "écouter", "mettre")
+        is_music = any(k in q_lower for k in music_keywords)
+        extra = None
+        if getattr(self, '_music_search_mode', False):
+            # Recherche vocale Spotify depuis ZIK
+            self._music_search_mode = False
+            self._disp("> " + q[:60], 18)
+            threading.Thread(target=self._handle_music_search, args=(q,), daemon=True).start()
+            return
+        if is_music:
+            extra = "Rémy demande de la musique sur Spotify. Tu dois: 1) chercher la chanson/album/artiste demandé via spotify_search, 2) si plusieurs résultats pertinents apparaissent, les lister brièvement avec numéros et demander quel numéro jouer, 3) sinon jouer directement le meilleur résultat sur l'appareil nommé Toth via spotify_playback. Ne donne pas d'explications longues."
+            print(f"[MUSIC] Détecté: {q}")
+        # Si déjà en train de répondre, stocke la question
+        if hasattr(self, '_asking') and self._asking:
+            self._pending_question = q
+            self._disp(f"Q+1\n> " + q[:25], 18)
+            print(f"[PENDING] Question stockée")
+            return
+        self._disp("> " + q, 18)
+        self._asking = True
+        self._pending_question = None
+        threading.Thread(target=self._ask_then_idle, args=(q, extra), daemon=True).start()
+
+    def _correct_music_query(self, query):
+        """Clean and correct the live transcription into a likely music search intent."""
+        import re
+        q = query.strip().lower()
+        # Supprimer les mots parasites / contexte de contrôle
+        q = re.sub(r"\b(toth|tote|toph|thor|tôt|tôtôt|ermes|hermès|hermes|rémy|remy|rémi|remi|dis?|dit|s'il te pla[îtit]|stp|merci|s'il vous pla[îtit]|voilà|hop|euh|hum|alors|ben)\b", "", q)
+        # Supprimer les incitations à jouer la musique
+        q = re.sub(r"\b(mets?|joue?|lance|cherche|trouve|veux|voudrais|écoute|ecoute|m'|me)\\s+(du|de la|de l'|un|une|la|le|les|des|ce|cette|ces|ca|ça|sa|son|ses|leur|leurs)?\\b", "", q)
+        # Normaliser les ponctuations multiples
+        q = re.sub(r"[.,;:!?\\-]+", " ", q)
+        # Nettoyer les espaces
+        q = re.sub(r"\\s+", " ", q).strip()
+        # Capitaliser la première lettre
+        if q:
+            q = q[0].upper() + q[1:]
+        return q if q else query.strip()
+
+
+    def _handle_music_search(self, query):
+        """Handle Spotify search via VPS endpoint: display results + auto-play first."""
+        self._stop_clock()
+        self._cancel_flag = False
+        with self.lock: self.state = STATE_WAITING
+        clean_q = self._correct_music_query(query)
+        print(f"[MUSIC SEARCH] raw='{query}' clean='{clean_q}'")
+        self._disp(f"Cherche:\n{clean_q}", 18)
+        def _do_search():
+            try:
+                import requests, json as _json
+                url = "http://49.13.237.85:9876/search"
+                headers = {
+                    "Authorization": "Bearer hermes-vps-key-mesh-2026",
+                    "Content-Type": "application/json"
+                }
+                payload = {"q": clean_q}
+                print("[MUSIC SEARCH] calling VPS endpoint...")
+                r = requests.post(url, headers=headers, json=payload, timeout=180)
+                print(f"[MUSIC SEARCH] endpoint status {r.status_code}")
+                if r.status_code != 200:
+                    self._disp("Erreur serveur", 18)
+                    threading.Timer(3.0, lambda: self._idle()).start()
+                    return
+                data = r.json()
+                results = data.get("results", [])
+                spoken = data.get("spoken", "")
+                if not results:
+                    self._disp("Pas de resultats", 18)
+                    threading.Timer(3.0, lambda: self._idle()).start()
+                    return
+                # Save results and show menu
+                self._media_music_results = results
+                self._media_music_result_idx = 0
+                self._media_music_results_menu = True
+                self._show_menu(self._menu_idx)
+                # Speak auto-play confirmation
+                if spoken:
+                    threading.Thread(target=self._speak_and_idle, args=(spoken,), daemon=True).start()
+            except Exception as e:
+                print(f"[MUSIC SEARCH] {e}")
+                self._disp("Erreur Spotify", 18)
+                threading.Timer(3.0, lambda: self._idle()).start()
+        threading.Thread(target=_do_search, daemon=True).start()
+    def _parse_music_results(self, answer):
+        """Try to parse JSON results from a Spotify search response. Return True if results found."""
+        import json as _json, re as _re
+        txt = answer.strip()
+        txt = _re.sub(r'```(?:json)?\s*', '', txt).replace('```', '')
+        start = txt.find('{')
+        end = txt.rfind('}')
+        if start == -1 or end == -1 or end <= start:
+            return False
+        try:
+            data = _json.loads(txt[start:end+1])
+            results = data.get('results', [])
+            if isinstance(results, list) and results:
+                clean = []
+                for r in results:
+                    if isinstance(r, dict) and 'name' in r:
+                        clean.append({
+                            'type': r.get('type', 'track'),
+                            'name': r.get('name', '?'),
+                            'artist': r.get('artist', ''),
+                            'uri': r.get('uri', '')
+                        })
+                if clean:
+                    self._media_music_results = clean
+                    print(f"[MUSIC RESULTS] {len(clean)} results parsed")
+                    return True
+        except Exception as e:
+            print(f"[MUSIC PARSE] {e}")
+        return False
+
+    def _play_selected_music(self, item):
+        """Play a selected Spotify item via le serveur Hermes local et affiche la page de lecture."""
+        name = item.get("name", "?")
+        artist = item.get("artist", "")
+        itype = item.get("type", "track")
+        search_q = f"{name} {artist}".strip()
+        # Switch immediatement a l'ecran de lecture
+        self._media_music_results_menu = False
+        self._media_music_playlist_menu = False
+        self._media_music_recent_menu = False
+        self._media_music_sel = 3
+        self._media_music_control_idx = 0
+        self._media_music_now_playing = {"name": name, "artist": artist, "type": itype, "is_playing": True}
+        self._show_menu(self._menu_idx)
+        self._start_spotify_poll()
+        # Lancer la lecture en arriere-plan via le serveur local
+        def _do_play():
+            try:
+                import urllib.request, json as _json
+                req = urllib.request.Request(
+                    "http://49.13.237.85:9876/search",
+                    data=_json.dumps({"q": search_q}).encode("utf-8"),
+                    headers={
+                        "Authorization": "Bearer hermes-vps-key-mesh-2026",
+                        "Content-Type": "application/json"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = resp.read().decode()
+                print(f"[MUSIC PLAY] {body[:200]}")
+            except Exception as e:
+                print(f"[MUSIC PLAY] {e}")
+        threading.Thread(target=_do_play, daemon=True).start()
+    def _start_spotify_poll(self):
+        if getattr(self, '_spotify_poll_timer', None):
+            try: self._spotify_poll_timer.cancel()
+            except Exception: pass
+        def _poll():
+            try:
+                answer, sid = hermes_ask("Quel est le titre en cours de lecture sur Spotify ? Réponds par JSON compact: {\"name\":\"...\",\"artist\":\"...\",\"is_playing\":true/false}.", timeout=30)
+                import json as _json, re as _re
+                txt = answer.strip()
+                txt = _re.sub(r'```(?:json)?\s*', '', txt).replace('```', '')
+                start = txt.find('{')
+                end = txt.rfind('}')
+                if start != -1 and end != -1 and end > start:
+                    data = _json.loads(txt[start:end+1])
+                    self._media_music_now_playing = {
+                        "name": data.get("name", "?"),
+                        "artist": data.get("artist", ""),
+                        "is_playing": bool(data.get("is_playing", False))
+                    }
+                    # Refresh display if we are on now-playing screen
+                    if self._media_music_sel == 3 and self._menu_items[self._menu_idx] == "MEDIA":
+                        cur_tab = self._media_tabs[self._media_idx % len(self._media_tabs)]
+                        if cur_tab == "ZIK" and getattr(self, '_media_inside', False):
+                            self._show_menu(self._menu_idx)
+            except Exception as e:
+                print(f"[SPOTIFY POLL] {e}")
+            # Reschedule
+            self._spotify_poll_timer = threading.Timer(10.0, _poll)
+            self._spotify_poll_timer.daemon = True
+            self._spotify_poll_timer.start()
+        self._spotify_poll_timer = threading.Timer(2.0, _poll)
+        self._spotify_poll_timer.daemon = True
+        self._spotify_poll_timer.start()
+
+    def _show_face_override(self, expr_idx, duration=3):
+        """Flash a specific expression for duration seconds."""
+        try:
+            data = render_robot_face(force_expr=expr_idx)
+            with self._display_lock:
+                self.board.draw_image(0, 0, 240, 280, data)
+            time.sleep(duration)
+        except Exception as e:
+            print(f"[FACE] Override error: {e}")
+
+    def _on_telegram_reply(self, text):
+        """Callback appelé quand une réponse Telegram arrive."""
+        try:
+            self._telegram_queue.put(text, block=False)
+        except Exception:
+            pass
+
+    def _ask_hermes_telegram(self, question, timeout=120):
+        """Envoie la question au bot Hermes via Telegram et attend la réponse texte."""
+        if not self._bridge or not self._bridge.ready:
+            self._disp("Telegram non pret", 18)
+            return None
+        # Vide la queue des anciennes réponses
+        while not self._telegram_queue.empty():
+            try:
+                self._telegram_queue.get_nowait()
+            except Exception:
+                break
+        self._bridge.send_question(question)
+        self._disp("Attente Hermes...", 18)
+        try:
+            return self._telegram_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+    def _ask_hermes(self, question, extra_instruction=None):
+        self._stop_clock()
+        self._cancel_flag = False
+        with self.lock: self.state = STATE_WAITING
+        threading.Thread(target=tg_send, args=("🏴‍☠️ Rémy 🏴‍☠️ " + question,), daemon=True).start()
+        
+        # Write waiting timestamp — watchdog can detect if we're stuck
+        try:
+            with open("/tmp/toth_waiting_since", "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+        
+        # Single attempt — no auto-retry loop.
+        # If Hermes doesn't answer in CALL_TIMEOUT, tell user and go idle.
+
+        CALL_TIMEOUT = 120  # 120 secondes max
+        
+        if self._cancel_flag:
+            print("[QUEUE] Cancelled before attempt")
+            try:
+                os.remove("/tmp/toth_waiting_since")
+            except Exception:
+                pass
+            self._idle()
+            return
+        
+        # Question stays visible — no overlay
+
+        # Appel avec 1 retry si échec
+        answer, sid = hermes_ask(question, timeout=CALL_TIMEOUT, extra_instruction=extra_instruction)
+        if not answer and not self._cancel_flag:
+            print("[ASK] Retry after 3s...")
+            time.sleep(3)
+            answer, sid = hermes_ask(question, timeout=CALL_TIMEOUT)
+        
+        if self._cancel_flag:
+            print("[ASK] Cancelled after Hermes call")
+            try: os.remove("/tmp/toth_waiting_since")
+            except Exception: pass
+            self._idle()
+            return
+        
+        if answer:
+            # Got a response — clear pending question
+            self._pending_question = None
+            # Write last response timestamp — watchdog sees we're alive
+            try:
+                with open("/tmp/toth_last_response", "w") as f:
+                    f.write(str(time.time()))
+                os.remove("/tmp/toth_waiting_since")
+            except Exception:
+                pass
+            # Show answer — adaptive font size: bigger for short text
+            answer_len = len(answer)
+            if answer_len <= 10:
+                fs = 48
+            elif answer_len <= 25:
+                fs = 36
+            elif answer_len <= 50:
+                fs = 30
+            elif answer_len <= 100:
+                fs = 26
+            else:
+                fs = 22
+            # Check cancel flag again before speaking
+            if not self._cancel_flag:
+                threading.Thread(target=self._speak_and_idle, args=(answer,), daemon=True).start()
+            else:
+                print("[ASK] Cancelled — answer shown but no TTS")
+                self._idle()
+        else:
+            # Timeout or API error — go idle silently
+            try:
+                os.remove("/tmp/toth_waiting_since")
+            except Exception:
+                pass
+            self._pending_question = None  # nettoyer pour éviter résurgence
+            print(f"[ASK] No answer — going idle silently")
+            self._idle()
+
+    def _speak_and_idle(self, text):
+        speak(clean_for_tts(text),
+              cancel_check=lambda: self._cancel_flag,
+              display_cb=lambda t, i, n, d=None: self._disp_scroll(t, i, n, d))
+        # Écrire dans le context_brief pour Hermes (pont bidirectionnel)
+        try:
+            with open("/tmp/toth_context_brief", "a") as f:
+                f.write(f"[Toth a dit] {text[:500]}\n")
+        except Exception:
+            pass
+        # Envoyer la reponse sur Telegram directement
+        try:
+            url = f"https://api.telegram.org/bot{T_T}/sendMessage"
+            requests.post(url, json={"chat_id": T_C, "text": text[:3800]}, timeout=10)
+        except Exception as e:
+            print(f"[TG] Failed to send answer: {e}")
+        self._idle()
+
+    def _send_to_hermes_and_speak(self, question, timeout=120):
+        """Envoie la question par Telegram, affiche et lit la réponse."""
+        answer = self._ask_hermes_telegram(question, timeout=timeout)
+        if answer:
+            self._speak_and_idle(answer)
+        else:
+            self._disp("Pas de reponse", 18)
+            self._idle()
+
+    def _ask_then_idle(self, question, extra_instruction=None):
+        """Pose la question, puis vérifie s'il y a une question en attente."""
+        self._ask_hermes(question, extra_instruction=extra_instruction)
+        self._asking = False
+        if hasattr(self, '_pending_question') and self._pending_question:
+            q = self._pending_question
+            self._pending_question = None
+            print(f"[PENDING] Traitement: {q[:40]}")
+            self._disp("> " + q, 18)
+            self._asking = True
+            threading.Thread(target=self._ask_then_idle, args=(q,), daemon=True).start()
+            return
+        self._idle()
+
+    def _idle(self):
+        global RADIO_WAS_PLAYING
+        print("[IDLE] Returning to idle...")
+        with self.lock: self.state = STATE_IDLE
+        # Reset recorder + flags
+        self._asking = False
+        self._pending_question = None
+        if self.rec:
+            try:
+                self.rec.stop()
+            except Exception:
+                pass
+            self.rec = None
+        self._stop_scroll()
+        self._stop_clock()
+        if RADIO_WAS_PLAYING:
+            print(f"[IDLE] Resuming radio: {RADIO_WAS_PLAYING}")
+            radio_mod.play_radio(RADIO_WAS_PLAYING)
+            RADIO_WAS_PLAYING = None
+        self._start_clock()
+
+
+    def _send_battery_telegram(self):
+        """Send battery status to Telegram chat (not on LCD to avoid flicker)."""
+        print("[BATT] Sending battery to Telegram...")
+        pct = read_battery()
+        if 0 <= pct <= 100:
+            emoji = "🔋" if pct > 60 else ("🔶" if pct > 20 else "🪫")
+            msg = f"{emoji} Batterie Toth : {pct}%"
+        else:
+            msg = "⚠️ Batterie Toth : indétectable"
+        try:
+            url = f"https://api.telegram.org/bot{T_T}/sendMessage"
+            requests.post(url, json={"chat_id": T_C, "text": msg}, timeout=5)
+            print(f"[BATT] Sent: {msg}")
+        except Exception as e:
+            print(f"[BATT] Telegram error: {e}")
+        # Re-schedule
+        if self._batt_timer:
+            self._batt_timer.cancel()
+        self._batt_timer = threading.Timer(900, self._send_battery_telegram)
+        self._batt_timer.daemon = True
+        self._batt_timer.start()
+
+    # ── Ring (JX‑05 Bluetooth) ────────────────────────────────────────
+    def _find_ring_device(self):
+        """Find the JX‑05 trackpad input event device. Returns path or None."""
+        try:
+            with open("/proc/bus/input/devices") as f:
+                content = f.read()
+            # Look for the trackpad block, not the Consumer Control keyboard
+            # Entry has: N: Name="JX-05" (not "JX-05 Consumer Control")
+            #            H: Handlers=mouse0 eventN
+            for block in content.split("\n\n"):
+                lines = block.strip().split("\n")
+                name_line = [l for l in lines if l.startswith("N: Name=")]
+                handlers_line = [l for l in lines if l.startswith("H: Handlers=")]
+                if name_line and handlers_line:
+                    name = name_line[0].split("=", 1)[1].strip().strip('"')
+                    handlers = handlers_line[0].split("=", 1)[1].strip()
+                    if name == "JX-05" and "mouse" in handlers:
+                        for part in handlers.split():
+                            if part.startswith("event"):
+                                path = "/dev/input/" + part
+                                print(f"[RING] Found device: {path}")
+                                return path
+        except Exception as e:
+            print(f"[RING] Device scan failed: {e}")
+        return None
+
+    
+    def _ring_watcher(self):
+        """Listen to JX-05 ring events and dispatch actions.
+        
+        JX-05 sends all events on event1 (trackpad):
+        - MIDDLE CLICK: BTN_TOUCH + TRACKING_ID + positions, short (<400ms), NO swipe
+        - HAUT/BAS/GAUCHE/DROITE: swipe (touch + movement + release)
+        - Double-tap: 2 quick touches (<600ms apart)
+        - Long-press HAUT/BAS: hold >400ms = volume ramp
+        
+        Detection strategy:
+        - Record x,y on ABS_MT_POSITION_X/Y
+        - On BTN_TOUCH=1: start timer
+        - On BTN_TOUCH=0: if hold < LONG_THRESH and positions exist but no movement -> middle click
+          else -> calculate swipe direction from first touch position
+        """
+        x_first = y_first = None      # First position of current touch
+        x_last = y_last = None        # Last position of current touch
+        x_pos = y_pos = None          # Current position being read
+        last_touch_up = 0             # Timestamp of last BTN_TOUCH=0
+        touch_start = 0               # Timestamp of BTN_TOUCH=1
+        touch_active = False          # Currently touching
+        had_position = False          # Did we get at least one position during this touch?
+        DBL_THRESH = 0.6              # Double-tap window in seconds
+        LONG_THRESH = 0.4             # Long-press threshold (>400ms)
+        SWIPE_DIST = 200              # Min pixel delta for swipe detection
+        LONG_ACTION_SENT = False
+        LONG_LAST_TICK = 0
+        RAMP_INTERVAL = 0.3
+
+        while True:
+            # Re-scan device path chaque boucle — le device peut changer
+            dev = self._find_ring_device()
+            if not dev:
+                print("[RING] Waiting for JX-05 device...")
+                time.sleep(3)
+                continue
+            if dev != self._ring_dev:
+                print(f"[RING] Device changed: {self._ring_dev} -> {dev}")
+                self._ring_dev = dev
+
+            print(f"[RING] Connecting to {self._ring_dev}...")
+            try:
+                fd = os.open(self._ring_dev, os.O_RDONLY)
+            except Exception as e:
+                print(f"[RING] Cannot open {self._ring_dev}: {e}")
+                time.sleep(3)
+                continue
+
+            print(f"[RING] Watching {self._ring_dev}")
+            try:
+                while True:
+                    data = os.read(fd, 24)
+                    tv_sec, tv_usec, typ, code, value = struct.unpack('llHHi', data)
+                    t_now = tv_sec + tv_usec * 1e-6
+
+                    # BTN_TOUCH (code 330)
+                    if typ == 1 and code == 330:
+                        if value == 1:
+                            self._wake_screen()
+                            touch_start = t_now
+                            touch_active = True
+                            LONG_ACTION_SENT = False
+                            x_last = y_last = x_pos = y_pos = None
+                            had_position = False
+                            # Ne PAS reset x_first/y_first — coords peuvent arriver AVANT BTN_TOUCH
+                        elif value == 0:
+                            if touch_active:
+                                dt_hold = t_now - touch_start
+                                dt_since_last = t_now - last_touch_up
+                                last_touch_up = t_now
+                                touch_active = False
+
+                                if not had_position:
+                                    print(f"[RING] Middle click (no pos, hold={dt_hold:.3f}s)")
+                                    self._ring_action("record")
+
+                                elif x_first is not None:
+                                    # Calculate swipe distance (fix: bague n'envoie parfois que X)
+                                    dx = (x_last or x_first) - x_first
+                                    dy = ((y_last or y_first) - y_first) if y_last is not None and y_first is not None else 0
+                                    dist = abs(dx) + abs(dy)
+
+                                    # Double-tap check
+                                    if 0 < dt_since_last < DBL_THRESH:
+                                        print(f"[RING] Double-tap detected")
+                                        self._ring_action("radio_toggle")
+
+                                    elif dist < SWIPE_DIST and dt_hold < LONG_THRESH:
+                                        # Short tap = check zone (haut/bas/gauche/droite/centre)
+                                        if x_first is not None:
+                                            zone = self._ring_zone(x_first, y_first)
+                                            if zone in ("haut", "bas", "gauche", "droite"):
+                                                print(f"[RING] Zone {zone.upper()} (x={x_first} y={y_first})")
+                                                self._ring_action(zone)
+                                            else:
+                                                print(f"[RING] Middle click (tap, x={x_first} y={y_first}, hold={dt_hold:.3f}s)")
+                                                self._ring_action("record")
+                                        else:
+                                            print(f"[RING] Middle click (tap, x={x_first} y={y_first}, hold={dt_hold:.3f}s)")
+                                            self._ring_action("record")
+
+                                    elif dist >= SWIPE_DIST and dt_hold < LONG_THRESH * 3:
+                                        # Swipe: determine direction
+                                        if abs(dx) > abs(dy):
+                                            if dx > 0:
+                                                print(f"[RING] Swipe RIGHT (dx={dx})")
+                                                self._ring_action("droite")
+                                            else:
+                                                print(f"[RING] Swipe LEFT (dx={dx})")
+                                                self._ring_action("gauche")
+                                        else:
+                                            if dy > 0:
+                                                print(f"[RING] Swipe DOWN (dy={dy})")
+                                                self._ring_action("bas")
+                                            else:
+                                                print(f"[RING] Swipe UP (dy={dy})")
+                                                self._ring_action("haut")
+
+                                    # Long-press release — no single-click action
+
+                    # ABS_MT_POSITION_X (code 53)
+                    elif typ == 3 and code == 53:
+                        x_pos = value
+                        if x_first is None:
+                            x_first = value
+                        x_last = value
+                        had_position = True
+
+                    # ABS_MT_POSITION_Y (code 54)
+                    elif typ == 3 and code == 54:
+                        y_pos = value
+                        if y_first is None:
+                            y_first = value
+                        y_last = value
+                        had_position = True
+
+                    # ABS_MT_TRACKING_ID (code 57) — ignore, we use our own state machine
+                    elif typ == 3 and code == 57:
+                        pass
+
+                    # Long-press ramp while holding a direction
+                    if touch_active and had_position and x_first is not None and y_first is not None:
+                        dt_hold = t_now - touch_start
+                        if dt_hold > LONG_THRESH and t_now - LONG_LAST_TICK > RAMP_INTERVAL:
+                            zone = self._ring_zone(x_first, y_first)
+                            if zone == "volume_up":
+                                self._ring_action("volume_up")
+                            elif zone == "volume_down":
+                                self._ring_action("volume_down")
+                            LONG_LAST_TICK = t_now
+                            LONG_ACTION_SENT = True
+            except OSError:
+                    print("[RING] Device disconnected — reconnecting in 2s...")
+                    try: os.close(fd)
+                    except Exception: pass
+                    time.sleep(2)
+
+
+    
+    def _ring_zone(self, x, y):
+        """Map X,Y touch coordinates to a button zone.
+        JX-05 pad is 0-4095 in both axes.
+        Calibrated 7 June 2026: HAUT Y=1012, BAS Y=2000-2300, GAUCHE X=436, DROITE X=1877.
+        Returns 'haut', 'bas', 'gauche', 'droite', or None.
+        """
+        if x is not None:
+            if x < 800:
+                return "gauche"
+            if x > 1400:
+                return "droite"
+        if y is not None:
+            if y < 1200:
+                return "haut"
+            if y > 1800:
+                return "bas"
+        return None
+
+    # MENU (15 June 2026) — regroupement MUSIQUE/RADIO/BOUQUIN sous MEDIA
+    _menu_items = ["MISSIVE", "MEDIA", "PARAMETRES"]
+    _menu_idx = 0
+
+    def _show_menu(self, idx):
+        if self._menu_items[idx] == "MEDIA":
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (240, 280), "#000000")
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype(FONT_PATH, 14)
+                    font_big = ImageFont.truetype(FONT_PATH, 22)
+                    font_med = ImageFont.truetype(FONT_PATH, 18)
+                    font_small = ImageFont.truetype(FONT_PATH, 12)
+                except:
+                    font = font_big = font_med = font_small = ImageFont.load_default()
+
+                # ── Barre d'onglets latéraux ──
+                tabs = self._media_tabs
+                sel = self._media_idx % len(tabs)
+                STRIP_W = 8
+                ROW_H = 36
+                LEFT_COL = 70
+                RIGHT_COL = 240
+                MID_COL = (LEFT_COL + RIGHT_COL) // 2
+                for i, tab in enumerate(tabs):
+                    y = 8 + i * ROW_H
+                    is_sel = (i == sel)
+                    color = "#00FF00" if is_sel else "#003300"
+                    draw.rectangle([0, y, STRIP_W, y + ROW_H - 4], fill=color)
+                    tc = "#FFFFFF" if is_sel else "#888888"
+                    draw.text((STRIP_W + 6, y + 8), tab, font=font, fill=tc)
+
+                cur_tab = tabs[sel]
+                inside = getattr(self, '_media_inside', False)
+
+                if cur_tab == "RADIO":
+                    stations = self._ring_radio_stations() or []
+                    total = len(stations)
+                    try:
+                        text = "RADIO \U0001F4FB"
+                        bbox = draw.textbbox((0, 0), text, font=font_big)
+                        w = bbox[2] - bbox[0]
+                        draw.text((MID_COL - w // 2, 12), text, font=font_big, fill="#FF00FF")
+                        if inside:
+                            MAX_VIS = 5
+                            cur = self._radio_station_idx % total if total else 0
+                            if total <= MAX_VIS:
+                                start = 0
+                            else:
+                                start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                            for j in range(MAX_VIS):
+                                i = start + j
+                                if i >= total:
+                                    break
+                                y = 55 + j * 40
+                                prefix = ">" if i == cur else "  "
+                                label = prefix + stations[i][0]
+                                bbox = draw.textbbox((0, 0), label, font=font_med)
+                                lw = bbox[2] - bbox[0]
+                                draw.text((MID_COL - lw // 2, y), label, font=font_med, fill="#00FF00" if i == cur else "#FFFF00")
+                            if total > MAX_VIS:
+                                dots = ".." if start > 0 else "  "
+                                dots += ".." if start + MAX_VIS < total else "  "
+                                draw.text((190, 245), dots, font=font, fill="#888888")
+                            state = "ON" if self._radio_playing else "OFF"
+                            stext = f"Radio {state}"
+                            bbox = draw.textbbox((0, 0), stext, font=font)
+                            sw = bbox[2] - bbox[0]
+                            draw.text((MID_COL - sw // 2, 270), stext, font=font, fill="#00FF00" if self._radio_playing else "#888888")
+                        else:
+                            msg = "Milieu = entrer"
+                            bbox = draw.textbbox((0, 0), msg, font=font_med)
+                            mw = bbox[2] - bbox[0]
+                            draw.text((MID_COL - mw // 2, 120), msg, font=font_med, fill="#CCCCCC")
+                    except Exception as e:
+                        self._disp("RADIO", 24)
+
+                elif cur_tab == "LIVRE":
+                    if inside:
+                        if self._book_mode == "chapters":
+                            draw.text((LEFT_COL, 12), "CHAPITRES", font=font_big, fill="#00FFFF")
+                            if self._books and self._book_idx < len(self._books):
+                                chs = self._books[self._book_idx]["chapters"]
+                                total = len(chs)
+                                MAX_VIS = 5
+                                items = ["REPRENDRE"] + [c.get("title", f"Chap. {c.get('num', i+1)}") for i, c in enumerate(chs)]
+                                total_items = len(items)
+                                cur = self._book_chapter_idx + 1
+                                if total_items <= MAX_VIS:
+                                    start_vis = 0
+                                else:
+                                    start_vis = max(0, min(cur - MAX_VIS // 2, total_items - MAX_VIS))
+                                for j in range(MAX_VIS):
+                                    i = start_vis + j
+                                    if i >= total_items:
+                                        break
+                                    y = 55 + j * 38
+                                    prefix = ">" if i == cur else "  "
+                                    t = items[i]
+                                    draw.text((LEFT_COL, y), prefix + t, font=font, fill="#00FF00" if i == cur else "#FFFF00")
+                                if total_items > MAX_VIS:
+                                    dots = ".." if start_vis > 0 else "  "
+                                    dots += ".." if start_vis + MAX_VIS < total_items else "  "
+                                    draw.text((190, 245), dots, font=font, fill="#888888")
+                            else:
+                                draw.text((LEFT_COL, 120), "Aucun livre", font=font_med, fill="#888888")
+                        elif self._book_mode == "book":
+                            if self._books and self._book_idx < len(self._books):
+                                book = self._books[self._book_idx]
+                                chs = book["chapters"]
+                                t = chs[self._book_chapter_idx].get("title", "?") if self._book_chapter_idx < len(chs) else "?"
+                                draw.text((LEFT_COL, 12), "BOUQUIN", font=font_big, fill="#00FFFF")
+                                draw.text((LEFT_COL, 50), t, font=font, fill="#FFFFFF")
+                                draw.text((LEFT_COL, 80), f"Pos: {self._book_char_pos}", font=font, fill="#888888")
+                                draw.text((LEFT_COL, 240), "[Lecture/Pause]", font=font, fill="#00CC00")
+                                draw.text((LEFT_COL, 260), "[Gauche = Options]", font=font, fill="#00CCFF")
+                            else:
+                                draw.text((LEFT_COL, 120), "Aucun livre", font=font_med, fill="#888888")
+                        else:
+                            draw.text((LEFT_COL + 10, 12), "LIVRES", font=font_big, fill="#00FFFF")
+                            if self._books:
+                                total = len(self._books)
+                                cur = self._book_idx % total
+                                MAX_VIS = 5
+                                if total <= MAX_VIS:
+                                    start = 0
+                                else:
+                                    start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                                for j in range(MAX_VIS):
+                                    i = start + j
+                                    if i >= total:
+                                        break
+                                    y = 55 + j * 38
+                                    prefix = ">" if i == cur else "  "
+                                    t = self._books[i]["title"][:22]
+                                    draw.text((LEFT_COL, y), prefix + t, font=font, fill="#00FF00" if i == cur else "#FFFF00")
+                                if total > MAX_VIS:
+                                    dots = ".." if start > 0 else "  "
+                                    dots += ".." if start + MAX_VIS < total else "  "
+                                    draw.text((190, 245), dots, font=font, fill="#888888")
+                            else:
+                                draw.text((LEFT_COL, 120), "Aucun livre chargé", font=font_med, fill="#888888")
+                    else:
+                        draw.text((LEFT_COL + 10, 12), "LIVRE", font=font_big, fill="#00FFFF")
+                        draw.text((LEFT_COL + 20, 120), "Milieu = entrer", font=font_med, fill="#CCCCCC")
+
+                elif cur_tab == "ZIK":
+                    draw.text((LEFT_COL + 30, 12), "Spotify", font=font_big, fill="#1DB954")
+                    if inside:
+                        if self._media_music_results_menu:
+                            results = self._media_music_results
+                            cur = self._media_music_result_idx % len(results) if results else 0
+                            draw.text((LEFT_COL, 50), "Resultats", font=font_med, fill="#CCCCCC")
+                            MAX_VIS = 5
+                            total = len(results)
+                            if total <= MAX_VIS:
+                                start = 0
+                            else:
+                                start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                            for j in range(MAX_VIS):
+                                i = start + j
+                                if i >= total:
+                                    break
+                                y = 75 + j * 38
+                                prefix = ">" if i == cur else "  "
+                                item = results[i]
+                                line = item.get("name", "?")[:18]
+                                artist = item.get("artist", "")
+                                if artist:
+                                    line += f" - {artist[:12]}"
+                                try:
+                                    fnt = font_small if len(line) > 22 else font_med
+                                except:
+                                    fnt = font_med
+                                draw.text((LEFT_COL, y), prefix + line, font=fnt, fill="#00FF00" if i == cur else "#FFFFFF")
+                            if total > MAX_VIS:
+                                dots = ".." if start > 0 else "  "
+                                dots += ".." if start + MAX_VIS < total else "  "
+                                draw.text((LEFT_COL + 120, 245), dots, font=font, fill="#888888")
+                            draw.text((LEFT_COL, 260), "Milieu=jouer", font=font, fill="#CCCCCC")
+                        elif self._media_music_sel == 3:
+                            # Now playing screen with on-screen buttons
+                            np = getattr(self, '_media_music_now_playing', None)
+                            buttons = getattr(self, '_media_music_controls', ["Précédent", "Play/Pause", "Suivant", "Stop"])
+                            btn_idx = getattr(self, '_media_music_control_idx', 0) % len(buttons)
+                            draw.text((LEFT_COL + 20, 12), "EN COURS", font=font_med, fill="#CCCCCC")
+                            if np:
+                                title = np.get("name", "?")[:22]
+                                artist = np.get("artist", "")[:22]
+                                status = "LECTURE" if np.get("is_playing", False) else "PAUSE"
+                                draw.text((LEFT_COL, 50), title, font=font_med, fill="#00FF00")
+                                if artist:
+                                    draw.text((LEFT_COL, 80), artist, font=font, fill="#FFFFFF")
+                                draw.text((LEFT_COL, 115), status, font=font_big, fill="#1DB954" if np.get("is_playing", False) else "#FF6600")
+                            else:
+                                draw.text((LEFT_COL, 50), "Rien en lecture", font=font_med, fill="#888888")
+                            # Draw 4 on-screen buttons; selected one highlighted
+                            btn_y = 160
+                            for i, label in enumerate(buttons):
+                                y = btn_y + i * 26
+                                color = "#00FF00" if i == btn_idx else "#CCCCCC"
+                                prefix = "> " if i == btn_idx else "  "
+                                draw.text((LEFT_COL, y), prefix + label, font=font, fill=color)
+                        elif self._media_music_playlist_menu:
+                            pls = self._media_music_playlists
+                            cur = self._media_music_playlist_idx % len(pls) if pls else 0
+                            draw.text((LEFT_COL, 50), "Mes playlists", font=font_med, fill="#CCCCCC")
+                            MAX_VIS = 5
+                            total = len(pls)
+                            if total <= MAX_VIS:
+                                start = 0
+                            else:
+                                start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                            for j in range(MAX_VIS):
+                                i = start + j
+                                if i >= total:
+                                    break
+                                y = 75 + j * 38
+                                prefix = ">" if i == cur else "  "
+                                name = pls[i]["name"][:20]
+                                draw.text((LEFT_COL, y), prefix + name, font=font_med, fill="#00FF00" if i == cur else "#FFFFFF")
+                            if total > MAX_VIS:
+                                dots = ".." if start > 0 else "  "
+                                dots += ".." if start + MAX_VIS < total else "  "
+                                draw.text((LEFT_COL + 120, 245), dots, font=font, fill="#888888")
+                            draw.text((LEFT_COL, 260), "Milieu=jouer", font=font, fill="#CCCCCC")
+                        elif self._media_music_recent_menu:
+                            recs = self._media_music_recent
+                            cur = self._media_music_recent_idx % len(recs) if recs else 0
+                            draw.text((LEFT_COL, 50), "Récent", font=font_med, fill="#CCCCCC")
+                            MAX_VIS = 5
+                            total = len(recs)
+                            if total <= MAX_VIS:
+                                start = 0
+                            else:
+                                start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                            for j in range(MAX_VIS):
+                                i = start + j
+                                if i >= total:
+                                    break
+                                y = 75 + j * 38
+                                prefix = ">" if i == cur else "  "
+                                name = recs[i].get("name", "?")[:22]
+                                draw.text((LEFT_COL, y), prefix + name, font=font_med, fill="#00FF00" if i == cur else "#FFFFFF")
+                            if total > MAX_VIS:
+                                dots = ".." if start > 0 else "  "
+                                dots += ".." if start + MAX_VIS < total else "  "
+                                draw.text((LEFT_COL + 120, 245), dots, font=font, fill="#888888")
+                            draw.text((LEFT_COL, 260), "Milieu=jouer", font=font, fill="#CCCCCC")
+                        else:
+                            opts = ["Rechercher", "Mes playlists", "Recent", "Lecture"]
+                            cur = self._media_music_sel % len(opts)
+                            for j, opt in enumerate(opts):
+                                y = 55 + j * 45
+                                prefix = ">" if j == cur else "  "
+                                draw.text((LEFT_COL, y), prefix + opt, font=font_med, fill="#00FF00" if j == cur else "#FFFFFF")
+                            draw.text((LEFT_COL, 210), "Milieu = select", font=font, fill="#CCCCCC")
+                    else:
+                        draw.text((LEFT_COL + 20, 120), "Milieu = entrer", font=font_med, fill="#CCCCCC")
+
+                data = pil_to_rgb565(img)
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, 280, data)
+            except Exception as e:
+                print(f"[DISP MEDIA] {e}")
+                self._disp("MEDIA", 24)
+
+
+        elif self._menu_items[idx] == "RADIO":
+            stations = self._ring_radio_stations() or []
+            total = len(stations)
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (240, 280), "#000000")
+                draw = ImageDraw.Draw(img)
+                try:
+                    font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+                    font     = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+                except:
+                    font_big = ImageFont.load_default()
+                    font     = font_big
+                # Title
+                text = "RADIO \U0001F4FB"
+                bbox = draw.textbbox((0, 0), text, font=font_big)
+                w = bbox[2] - bbox[0]
+                draw.text(((240 - w) // 2, 12), text, font=font_big, fill="#FF00FF")
+                # Scrolling viewport: show 6 at a time, cursor in middle if possible
+                MAX_VIS = 6
+                cur = self._radio_station_idx % total if total else 0
+                if total <= MAX_VIS:
+                    start = 0
+                else:
+                    # Keep cursor roughly in middle of viewport
+                    start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                for j in range(MAX_VIS):
+                    i = start + j
+                    if i >= total:
+                        break
+                    y = 55 + j * 36
+                    prefix = ">" if i == cur else "  "
+                    draw.text((8, y), prefix + stations[i][0], font=font, fill="#00FF00" if i == cur else "#FFFF00")
+                # If scrolling active show dots
+                if total > MAX_VIS:
+                    dots = ".." if start > 0 else "  "
+                    dots += ".." if start + MAX_VIS < total else "  "
+                    draw.text((190, 240), dots, font=font, fill="#888888")
+                data = pil_to_rgb565(img)
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, 280, data)
+            except Exception as e:
+                self._disp("RADIO", 24)
+        elif self._menu_items[idx] == "MUSIQUE":
+            try:
+                import subprocess
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (240, 280), "#000000")
+                draw = ImageDraw.Draw(img)
+                try:
+                    font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+                    font     = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 16)
+                except:
+                    font_big = ImageFont.load_default()
+                    font     = font_big
+                draw.text((60, 12), "MUSIQUE", font=font_big, fill="#FF00FF")
+                # Infos musique
+                try:
+                    title = subprocess.check_output(["playerctl", "metadata", "--format", "{{title}}"], timeout=2).decode().strip()[:22]
+                except: title = "?"
+                try:
+                    artist = subprocess.check_output(["playerctl", "metadata", "--format", "{{artist}}"], timeout=2).decode().strip()[:22]
+                except: artist = "?"
+                try:
+                    status = subprocess.check_output(["playerctl", "status"], timeout=2).decode().strip()
+                except: status = "?"
+                draw.text((10, 55), f"T: {title}", font=font, fill="#FFFF00")
+                draw.text((10, 80), f"A: {artist}", font=font, fill="#00FFFF")
+                col = "#00FF00" if status == "Playing" else "#FF4444"
+                draw.text((10, 110), f"S: {status}", font=font, fill=col)
+                # Volume
+                try:
+                    vol = subprocess.check_output(["playerctl", "volume"], timeout=2).decode().strip()
+                    vol_pct = int(float(vol) * 100)
+                except: vol_pct = 0
+                draw.text((10, 150), f"Vol: {vol_pct}%", font=font, fill="#888888")
+                # Controles
+                draw.text((10, 190), "Milieu = Recherche", font=font, fill="#CCCCCC")
+                draw.text((10, 210), "Double = Play/Pause", font=font, fill="#CCCCCC")
+                draw.text((10, 230), "G/D = Prev/Next", font=font, fill="#CCCCCC")
+                draw.text((10, 250), "Haut/Bas = Vol +-", font=font, fill="#CCCCCC")
+                data = pil_to_rgb565(img)
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, 280, data)
+            except Exception as e:
+                self._disp("MUSIQUE", 24)
+
+        elif self._menu_items[idx] == "PARAMETRES":
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (240, 280), "#000000")
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+                    font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+                    font_med = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+                except:
+                    font = ImageFont.load_default()
+                    font_big = font
+                    font_med = font
+                # ── Barre latérale colorée avec texte horizontal ──
+                tabs = self._param_tabs
+                sel = self._param_submenu_idx % len(tabs)
+                STRIP_W = 6
+                ROW_H = 36
+                for i, tab in enumerate(tabs):
+                    y = 8 + i * ROW_H
+                    color = "#00FF00" if i == sel else "#005500"
+                    is_sel = (i == sel)
+                    # Colored strip (full height on left)
+                    draw.rectangle([0, y, STRIP_W, y + ROW_H - 4], fill=color)
+                    # Text label next to strip
+                    tc = "#FFFFFF" if is_sel else "#888888"
+                    draw.text((STRIP_W + 8, y + 6), tab, font=font, fill=tc)
+                    # Arrow if selected
+                    if is_sel:
+                        draw.text((STRIP_W + 80, y + 6), ">", font=font, fill="#FFFFFF")
+                # ── Zone droite: contenu ──
+                cur_tab = tabs[sel]
+                CX = 75  # centre de la zone droite
+                if cur_tab == "SON":
+                    adj = self._param_son_adjusting
+                    title = "REGLAGE" if adj else "VOLUME"
+                    col = "#FFFF00" if adj else "#00FFFF"
+                    draw.text((CX, 20), title, font=font_big, fill=col)
+                    pct = self._volume_pct
+                    draw.text((CX, 80), f"{pct}%", font=font_big, fill="#00FF00")
+                    bar_w = 110
+                    filled = int(bar_w * pct / 100)
+                    border = "#FFFF00" if adj else "#FFFFFF"
+                    draw.rectangle([CX, 130, CX + bar_w, 150], outline=border, width=1)
+                    draw.rectangle([CX, 130, CX + filled, 150], fill="#00FF00")
+                elif cur_tab == "BOOT":
+                    if self._boot_submenu:
+                        draw.text((80, 12), "BOOT", font=font_big, fill="#FFFF00")
+                        opts = self._boot_options
+                        total = len(opts)
+                        MAX_VIS = 4
+                        cur = self._boot_idx % total
+                        if total <= MAX_VIS:
+                            start = 0
+                        else:
+                            start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                        for j in range(MAX_VIS):
+                            i = start + j
+                            if i >= total:
+                                break
+                            y = 55 + j * 50
+                            prefix = ">" if i == cur else "  "
+                            draw.text((55, y), prefix + opts[i], font=font_med, fill="#00FF00" if i == cur else "#FFFF00")
+                    else:
+                        draw.text((80, 40), "BOOT", font=font_big, fill="#FFFF00")
+                        draw.text((80, 100), "Milieu = actions", font=font_med, fill="#CCCCCC")
+                elif cur_tab == "BT":
+                    if self._bt_submenu:
+                        devs = self._bt_devices
+                        total = len(devs)
+                        MAX_VIS = 4
+                        cur = self._bt_selected_idx % max(1, total) if total else 0
+                        title = "SCAN" if self._bt_scanning else "APPAREILS"
+                        draw.text((110, 12), title, font=font_big, fill="#0088FF")
+                        if total == 0:
+                            txt = "Scan en cours..." if self._bt_scanning else "Aucun appareil"
+                            draw.text((120, 80), txt, font=font_med, fill="#CCCCCC")
+                        else:
+                            if total <= MAX_VIS:
+                                start = 0
+                            else:
+                                start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                            for j in range(MAX_VIS):
+                                i = start + j
+                                if i >= total:
+                                    break
+                                y = 55 + j * 50
+                                d = devs[i]
+                                prefix = ">" if i == cur else "  "
+                                name = d.get("name", "?")[:15]
+                                status = "C" if d.get("connected") else ("P" if d.get("paired") else "N")
+                                line = f"{prefix}{name} [{status}]"
+                                draw.text((120, y), line, font=font_med, fill="#00FF00" if i == cur else "#FFFFF0")
+                            if total > MAX_VIS:
+                                dots = ".." if start > 0 else "  "
+                                dots += ".." if start + MAX_VIS < total else "  "
+                                draw.text((210, 240), dots, font=font, fill="#888888")
+                        draw.text((120, 260), "Milieu=gerer  Gauche=retour", font=font, fill="#888888")
+                    elif self._bt_inside:
+                        draw.text((110, 12), "BT", font=font_big, fill="#0088FF")
+                        opts = ["APPAREILS", "SCANNER", "BT ON", "BT OFF"]
+                        cur = self._bt_idx % len(opts)
+                        for j, opt in enumerate(opts):
+                            y = 55 + j * 50
+                            prefix = ">" if j == cur else "  "
+                            color = "#00FF00" if j == cur else "#FFFF00"
+                            draw.text((120, y), prefix + opt, font=font_med, fill=color)
+                        draw.text((120, 260), "Milieu = select  Droite = back", font=font, fill="#888888")
+                    else:
+                        draw.text((110, 12), "BT", font=font_big, fill="#0088FF")
+                        draw.text((110, 100), "Milieu = entrer", font=font_med, fill="#CCCCCC")
+                elif cur_tab == "VIE":
+                    if self._param_vie_confirm:
+                        draw.text((80, 100), "RAFRAICHI", font=font_big, fill="#00FF00")
+                    else:
+                        draw.text((60, 20), "VIE", font=font_big, fill="#00CCFF")
+                        draw.text((60, 65), f"RAM: {self._const_ram_used}/{self._const_ram_total}M", font=font_med, fill="#FFFFFF")
+                        draw.text((60, 105), f"Swap: {self._const_swap_used}/{self._const_swap_total}M", font=font_med, fill="#FFFFFF")
+                        draw.text((60, 145), f"Temp: {self._const_temp}", font=font_med, fill="#FFFFFF")
+                        draw.text((60, 185), f"Load: {self._const_load}", font=font_med, fill="#FFFFFF")
+                        draw.text((60, 225), f"Disk: {self._const_disk_used} ({self._const_disk_pct})", font=font_med, fill="#FFFFFF")
+                elif cur_tab == "SSH":
+                    if self._param_tunnel_confirm:
+                        draw.text((120, 60), "SSH", font=font_big, fill="#00FF00")
+                        draw.text((120, 100), "RELANCE", font=font_big, fill="#00FF00")
+                    else:
+                        draw.text((60, 20), "SSH", font=font_big, fill="#00FF88")
+                        draw.text((60, 80), "REVERSE", font=font_med, fill="#CCCCCC")
+                        draw.text((60, 120), "Tap = relancer", font=font_med, fill="#FFFFFF")
+                elif cur_tab == "NET":
+                    try:
+                        font_small = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11)
+                    except:
+                        font_small = font
+                    draw.text((60, 20), "NET", font=font_big, fill="#FF8800")
+                    # Host
+                    draw.text((60, 55), "Host", font=font_small, fill="#AAAAAA")
+                    draw.text((60, 68), self._net_hostname, font=font_med, fill="#FFFFFF")
+                    # IP
+                    draw.text((60, 105), "IP", font=font_small, fill="#AAAAAA")
+                    draw.text((60, 118), self._net_local_ip, font=font_med, fill="#FFFFFF")
+                    # Tail
+                    draw.text((60, 155), "Tail", font=font_small, fill="#AAAAAA")
+                    draw.text((60, 168), self._net_tailscale_ip, font=font_med, fill="#FFFFFF")
+                    # WiFi
+                    draw.text((60, 205), "WiFi", font=font_small, fill="#AAAAAA")
+                    draw.text((60, 218), self._net_wifi_ssid, font=font_med, fill="#FFFFFF")
+                    # Tailscale ON/OFF toggle
+                    ts_state = "ON" if self._net_tailscale_on else "OFF"
+                    ts_col = "#00FF00" if self._net_tailscale_on else "#FF4444"
+                    draw.text((60, 245), "TS: " + ts_state, font=font_small, fill=ts_col)
+                data = pil_to_rgb565(img)
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, 280, data)
+            except Exception:
+                pass
+        elif self._menu_items[idx] == "MISSIVE":
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (240, 280), "#000000")
+                draw = ImageDraw.Draw(img)
+                try:
+                    fb = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+                    fm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+                    fs = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+                except:
+                    fb = ImageFont.load_default()
+                    fm = fb
+                    fs = fb
+                # --- Historique en haut (3 derniers messages) ---
+                msgs = self._missive_history[-3:] if hasattr(self, '_missive_history') else []
+                y = 8
+                for m in msgs:
+                    role = m.get("role", "?")[:1].upper()
+                    text = m.get("text", "")[:28]
+                    col = "#00FF00" if role == "V" else "#00CCFF"
+                    draw.text((8, y), f"[{role}] {text}", font=fs, fill=col)
+                    y += 18
+                draw.line([0, y+2, 240, y+2], fill="#444444", width=1)
+                # --- Bouton PARLER / ENVOYER / ANNULER ---
+                state = self._missive_state if hasattr(self, '_missive_state') else "idle"
+                if state == "idle":
+                    btn_text = "PARLER"
+                    btn_col = "#FFFF00"
+                    info = "Milieu = parler"
+                elif state == "recording":
+                    btn_text = "STOP"
+                    btn_col = "#FF0000"
+                    info = "Tape pour stop"
+                elif state == "preview":
+                    preview = self._missive_preview if hasattr(self, "_missive_preview") else ""
+                    lines = preview[:60].split(chr(10))
+                    py = y + 10
+                    for ln in lines[:3]:
+                        draw.text((8, py), ln, font=fs, fill="#FFFFFF")
+                        py += 16
+                    btn_text = "ENVOYER"
+                    btn_col = "#00FF00"
+                    info = "Milieu=Confirmer"
+                elif state == "confirm":
+                    preview = self._missive_preview if hasattr(self, "_missive_preview") else ""
+                    lines = preview[:60].split(chr(10))
+                    py = y + 10
+                    for ln in lines[:3]:
+                        draw.text((8, py), ln, font=fs, fill="#FFFFFF")
+                        py += 16
+                    draw.text(((240 - 80)//2, 130), "ENVOYER", font=fb, fill="#00FF00")
+                    draw.text(((240 - 80)//2, 165), "ANNULER", font=fb, fill="#FF0000")
+                    btn_text = None
+                    btn_col = None
+                    info = "Milieu=Envoyer Haut/Bas=Annuler"
+                else:
+                    btn_text = "PARLER"
+                    btn_col = "#FFFF00"
+                    info = "Milieu = parler"
+                if btn_text:
+                    bbox = draw.textbbox((0, 0), btn_text, font=fb)
+                    w = bbox[2] - bbox[0]
+                    draw.text(((240 - w) // 2, 140), btn_text, font=fb, fill=btn_col)
+                draw.text(((240 - len(info)*8) // 2, 190), info, font=fs, fill="#888888")
+                data = pil_to_rgb565(img)
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, 280, data)
+            except Exception:
+                self._disp("MISSIVE", 24)
+        elif self._menu_items[idx] == "BOUQUIN":
+            try:
+                from PIL import Image, ImageDraw, ImageFont
+                img = Image.new("RGB", (240, 280), "#000000")
+                draw = ImageDraw.Draw(img)
+                try:
+                    fb = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+                    fm = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+                    fs = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+                except:
+                    fb = ImageFont.load_default()
+                    fm = fb
+                    fs = fb
+                if self._book_mode == "chapters":
+                    draw.text((60, 12), "CHAPITRES", font=fb, fill="#00FFFF")
+                    if self._books and self._book_idx < len(self._books):
+                        chs = self._books[self._book_idx]["chapters"]
+                        total = len(chs)
+                        MAX_VIS = 6
+                        items = ["REPRENDRE"] + [c.get("title", f"Chap. {c.get('num', i+1)}") for i, c in enumerate(chs)]
+                        total_items = len(items)
+                        cur = self._book_chapter_idx + 1   # +1 because REPRENDRE is index 0
+                        if total_items <= MAX_VIS:
+                            start_vis = 0
+                        else:
+                            start_vis = max(0, min(cur - MAX_VIS // 2, total_items - MAX_VIS))
+                        for j in range(MAX_VIS):
+                            i = start_vis + j
+                            if i >= total_items:
+                                break
+                            y = 55 + j * 34
+                            prefix = ">" if i == cur else "  "
+                            t = items[i]
+                            draw.text((8, y), prefix + t, font=fs, fill="#00FF00" if i == cur else "#FFFF00")
+                        if total_items > MAX_VIS:
+                            dots = ".." if start_vis > 0 else "  "
+                            dots += ".." if start_vis + MAX_VIS < total_items else "  "
+                            draw.text((190, 240), dots, font=fs, fill="#888888")
+                    else:
+                        draw.text((20, 120), "Aucun livre", font=fm, fill="#888888")
+                elif self._book_mode == "book":
+                    # ── Book reading screen ──
+                    if self._books and self._book_idx < len(self._books):
+                        book = self._books[self._book_idx]
+                        chs = book["chapters"]
+                        t = chs[self._book_chapter_idx].get("title", "?") if self._book_chapter_idx < len(chs) else "?"
+                        draw.text((8, 12), "BOUQUIN", font=fb, fill="#00FFFF")
+                        draw.text((8, 50), t, font=fs, fill="#FFFFFF")
+                        draw.text((8, 80), f"Pos: {self._book_char_pos}", font=fs, fill="#888888")
+                        draw.text((8, 240), "[Lecture/Pause]", font=fs, fill="#00CC00")
+                        draw.text((8, 260), "[Gauche = Options]", font=fs, fill="#00CCFF")
+                    else:
+                        draw.text((8, 50), "Aucun livre", font=fm, fill="#888888")
+                else:
+                    # ── Book list ──
+                    draw.text((60, 12), "BOUQUIN", font=fb, fill="#00FFFF")
+                    if self._books:
+                        total = len(self._books)
+                        cur = self._book_idx % total
+                        MAX_VIS = 6
+                        if total <= MAX_VIS:
+                            start = 0
+                        else:
+                            start = max(0, min(cur - MAX_VIS // 2, total - MAX_VIS))
+                        for j in range(MAX_VIS):
+                            i = start + j
+                            if i >= total:
+                                break
+                            y = 55 + j * 34
+                            prefix = ">" if i == cur else "  "
+                            t = self._books[i]["title"][:22]
+                            draw.text((8, y), prefix + t, font=fs, fill="#00FF00" if i == cur else "#FFFF00")
+                        if total > MAX_VIS:
+                            dots = ".." if start > 0 else "  "
+                            dots += ".." if start + MAX_VIS < total else "  "
+                            draw.text((190, 240), dots, font=fs, fill="#888888")
+                    else:
+                        draw.text((20, 120), "Aucun livre chargé", font=fm, fill="#888888")
+                data = pil_to_rgb565(img)
+                with self._display_lock:
+                    self.board.draw_image(0, 0, 240, 280, data)
+            except Exception as e:
+                print(f"[DISP BOUQUIN] {e}")
+        else:
+            self._disp(self._menu_items[idx], 24)
+
+    def _load_spotify_recent(self):
+        """Charge les albums/artistes récemment écoutés sur Spotify via le serveur Hermes local."""
+        try:
+            self._disp("Recent...", 20)
+            import urllib.request, json as _json
+            req = urllib.request.Request(
+                "http://49.13.237.85:9876/recent",
+                data=b"{}",
+                headers={
+                    "Authorization": "Bearer hermes-vps-key-mesh-2026",
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode())
+            self._media_music_recent = data[:8] if isinstance(data, list) else []
+            self._media_music_recent_idx = 0
+            self._show_menu(self._menu_idx)
+        except Exception as e:
+            print(f"[SPOTIFY RECENT] {e}")
+            self._media_music_recent = []
+            self._disp("Erreur recent", 18)
+
+    def _load_spotify_playlists(self):
+        """Charge les playlists Spotify via le serveur Hermes local."""
+        try:
+            self._disp("Playlists...", 20)
+            import urllib.request, json as _json
+            req = urllib.request.Request(
+                "http://49.13.237.85:9876/playlists",
+                data=b"{}",
+                headers={
+                    "Authorization": "Bearer hermes-vps-key-mesh-2026",
+                    "Content-Type": "application/json"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode())
+            self._media_music_playlists = data if isinstance(data, list) else []
+            self._media_music_playlist_idx = 0
+            self._show_menu(self._menu_idx)
+        except Exception as e:
+            print(f"[SPOTIFY PL] {e}")
+            self._media_music_playlists = []
+            self._disp("Erreur playlists", 18)
+
+    def _ring_action(self, action):
+        try:
+            if action == "record":
+                if self.state == STATE_RECORD:
+                    self._process()
+                    return
+                if self._menu_items[self._menu_idx] == "MEDIA":
+                    cur_tab = self._media_tabs[self._media_idx % len(self._media_tabs)]
+                    inside = getattr(self, '_media_inside', False)
+                    if not inside:
+                        # Milieu = entrer dans l'onglet sélectionné
+                        self._media_inside = True
+                        self._show_menu(self._menu_idx)
+                    else:
+                        # Déjà dedans: action secondaire selon onglet
+                        if cur_tab == "RADIO":
+                            self._ring_radio_toggle()
+                        elif cur_tab == "ZIK":
+                            if self._media_music_playlist_menu:
+                                pls = self._media_music_playlists
+                                if pls:
+                                    idx = self._media_music_playlist_idx % len(pls)
+                                    name = pls[idx]["name"]
+                                    threading.Thread(target=self._send_to_hermes_and_speak, args=(f"Joue la playlist Spotify \"{name}\" sur l'appareil Toth",), daemon=True).start()
+                                    self._disp("Lecture...", 24)
+                                self._media_music_playlist_menu = False
+                                return
+                            if self._media_music_recent_menu:
+                                recs = self._media_music_recent
+                                if recs:
+                                    idx = self._media_music_recent_idx % len(recs)
+                                    item = recs[idx]
+                                    name = item.get("name", "?")
+                                    artist = item.get("artist", "")
+                                    itype = item.get("type", "album")
+                                    query = f"Joue {itype} {name}"
+                                    if artist:
+                                        query += f" de {artist}"
+                                    query += " sur Spotify sur l'appareil Toth"
+                                    threading.Thread(target=self._send_to_hermes_and_speak, args=(query,), daemon=True).start()
+                                    self._disp("Lecture...", 24)
+                                self._media_music_recent_menu = False
+                                return
+                            if self._media_music_results_menu:
+                                results = self._media_music_results
+                                if results:
+                                    idx = self._media_music_result_idx % len(results)
+                                    item = results[idx]
+                                    self._play_selected_music(item)
+                                else:
+                                    self._media_music_results_menu = False
+                                return
+                            if self._media_music_sel == 0:
+                                # Rechercher : lance la recherche vocale Spotify via bague
+                                self._music_search_mode = True
+                                self._record(music=True)
+                                return
+                            if self._media_music_sel == 3:
+                                # Écran lecture : milieu active le bouton sélectionné
+                                import subprocess
+                                btn = self._media_music_controls[self._media_music_control_idx % len(self._media_music_controls)]
+                                try:
+                                    if btn == "Précédent":
+                                        subprocess.run(["playerctl", "previous"], timeout=3)
+                                        self._disp("Précédent", 22)
+                                    elif btn == "Suivant":
+                                        subprocess.run(["playerctl", "next"], timeout=3)
+                                        self._disp("Suivant", 22)
+                                    elif btn == "Play/Pause":
+                                        subprocess.run(["playerctl", "play-pause"], timeout=3)
+                                        self._disp("Play / Pause", 22)
+                                    elif btn == "Stop":
+                                        subprocess.run(["playerctl", "stop"], timeout=3)
+                                        self._media_music_sel = 0
+                                        self._disp("Arrêt", 22)
+                                except Exception as e:
+                                    print(f"[MUSIC] button error: {e}")
+                                return
+                            if self._media_music_sel == 1:
+                                # Mes playlists : charge et affiche la liste
+                                self._media_music_playlist_idx = 0
+                                self._media_music_playlist_menu = True
+                                threading.Thread(target=self._load_spotify_playlists, daemon=True).start()
+                                self._disp("Chargement...", 24)
+                            else:
+                                # Recent : charge et affiche la liste
+                                self._media_music_recent_idx = 0
+                                self._media_music_recent_menu = True
+                                threading.Thread(target=self._load_spotify_recent, daemon=True).start()
+                                self._disp("Chargement...", 24)
+                        elif cur_tab == "LIVRE":
+                            if self._book_mode == "chapters":
+                                if self._book_chapter_idx == -1:
+                                    self._book_mode = "book"
+                                else:
+                                    self._book_char_pos = 0
+                                    self._save_book_state()
+                                    self._book_mode = "book"
+                                threading.Thread(target=self._book_speak_chunk, daemon=True).start()
+                                self._show_menu(self._menu_idx)
+                            elif self._book_mode == "book":
+                                threading.Thread(target=self._book_speak_chunk, daemon=True).start()
+                                self._show_menu(self._menu_idx)
+                            else:
+                                if self._books:
+                                    self._book_mode = "chapters"
+                                    self._show_menu(self._menu_idx)
+                elif self._menu_items[self._menu_idx] == "PARAMETRES":
+                    self._param_handle_record()
+                else:
+                    self._btn_press()
+                    self._btn_release()
+
+            elif action in ("droite", "gauche"):
+                if self._menu_items[self._menu_idx] == "MEDIA":
+                    inside = getattr(self, '_media_inside', False)
+                    cur_tab = self._media_tabs[self._media_idx % len(self._media_tabs)]
+                    if inside and cur_tab == "LIVRE" and self._book_mode in ("chapters", "book"):
+                        if action == "gauche":
+                            if self._book_mode == "chapters":
+                                self._book_mode = "menu"
+                            elif self._book_mode == "book":
+                                self._book_mode = "chapters"
+                        else:
+                            self._book_mode = "menu"
+                        self._show_menu(self._menu_idx)
+                    elif inside:
+                        cur_tab = self._media_tabs[self._media_idx % len(self._media_tabs)]
+                        if cur_tab == "ZIK":
+                            # Si on est dans un sous-menu ZIK, gauche/droite sortent au menu ZIK
+                            if self._media_music_results_menu or self._media_music_playlist_menu or self._media_music_recent_menu:
+                                self._media_music_results_menu = False
+                                self._media_music_playlist_menu = False
+                                self._media_music_recent_menu = False
+                                self._show_menu(self._menu_idx)
+                                return
+                            if self._media_music_results_menu:
+                                if action == "gauche":
+                                    self._media_music_results_menu = False
+                                    self._show_menu(self._menu_idx)
+                                    return
+                                elif action == "droite":
+                                    self._media_music_results_menu = False
+                                    self._media_inside = False
+                                    self._show_menu(self._menu_idx)
+                                    return
+                            elif self._media_music_playlist_menu or self._media_music_recent_menu:
+                                # Premier gauche/droite depuis la liste playlists/recents : retour au menu Spotify
+                                self._media_music_playlist_menu = False
+                                self._media_music_recent_menu = False
+                            elif self._media_music_sel == 3:
+                                # Écran lecture : gauche/droite retournent au menu ZIK
+                                self._media_music_sel = 0
+                                self._show_menu(self._menu_idx)
+                                return
+                            else:
+                                # Dans ZIK sans sous-menu : gauche/droite sortent à la sélection d'onglets MEDIA
+                                self._media_inside = False
+                        else:
+                            # Premier gauche/droite depuis un onglet MEDIA : retour à la sélection d'onglets
+                            self._media_inside = False
+                        self._show_menu(self._menu_idx)
+                    else:
+                        # Déjà sur la sélection d'onglets : change de page menu principal
+                        self._menu_idx = (self._menu_idx + (1 if action == "droite" else -1)) % len(self._menu_items)
+                        if self._menu_items[self._menu_idx] != "MEDIA":
+                            self._book_mode = "menu"
+                        self._show_menu(self._menu_idx)
+                elif self._menu_items[self._menu_idx] == "PARAMETRES":
+                    tabs = self._param_tabs
+                    cur_tab = tabs[self._param_submenu_idx % len(tabs)]
+                    inside = (cur_tab == "SON" and self._param_son_adjusting) or (cur_tab == "BOOT" and self._boot_submenu) or (cur_tab == "BT" and (self._bt_submenu or self._bt_inside))
+                    if inside:
+                        # Premier gauche/droite : sort du sous-menu, retour à la sélection d'onglets PARAMETRES
+                        self._param_son_adjusting = False
+                        self._boot_submenu = False
+                        self._bt_submenu = False
+                        self._bt_inside = False
+                        self._bt_idx = 0
+                        self._show_menu(self._menu_idx)
+                    else:
+                        # Déjà sur la sélection d'onglets : change de page menu principal
+                        self._menu_idx = (self._menu_idx + (1 if action == "droite" else -1)) % len(self._menu_items)
+                        self._show_menu(self._menu_idx)
+                else:
+                    self._menu_idx = (self._menu_idx + (1 if action == "droite" else -1)) % len(self._menu_items)
+                    self._show_menu(self._menu_idx)
+
+            elif action in ("haut", "bas"):
+                if self._menu_items[self._menu_idx] == "MEDIA":
+                    inside = getattr(self, '_media_inside', False)
+                    cur_tab = self._media_tabs[self._media_idx % len(self._media_tabs)]
+                    if not inside:
+                        # haut/bas change d'onglet
+                        if action == "haut":
+                            self._media_idx = (self._media_idx + 1) % len(self._media_tabs)
+                        else:
+                            self._media_idx = (self._media_idx - 1) % len(self._media_tabs)
+                        self._show_menu(self._menu_idx)
+                    else:
+                        # dedans: navigation selon onglet
+                        if cur_tab == "RADIO":
+                            total = len(self._ring_radio_stations())
+                            if total:
+                                if action == "haut":
+                                    self._radio_station_idx = (self._radio_station_idx + 1) % total
+                                else:
+                                    self._radio_station_idx = (self._radio_station_idx - 1) % total
+                            self._show_menu(self._menu_idx)
+                        elif cur_tab == "LIVRE":
+                            if self._book_mode == "chapters":
+                                if self._books and self._book_idx < len(self._books):
+                                    total = len(self._books[self._book_idx]["chapters"])
+                                    cur = self._book_chapter_idx
+                                    if action == "haut":
+                                        cur = -1 if cur == total - 1 else (cur + 1)
+                                    else:
+                                        cur = total - 1 if cur == -1 else (cur - 1)
+                                    self._book_chapter_idx = cur
+                                    self._save_book_state()
+                                    self._show_menu(self._menu_idx)
+                            elif self._book_mode == "book":
+                                text = self._book_get_current_text()
+                                if action == "haut":
+                                    self._book_char_pos = max(0, self._book_char_pos - 1000)
+                                else:
+                                    self._book_char_pos = min(len(text), self._book_char_pos + 1000)
+                                self._save_book_state()
+                                self._show_menu(self._menu_idx)
+                            else:
+                                if self._books:
+                                    total = len(self._books)
+                                    if action == "haut":
+                                        self._book_idx = (self._book_idx + 1) % total
+                                    else:
+                                        self._book_idx = (self._book_idx - 1) % total
+                                    self._show_menu(self._menu_idx)
+                        elif cur_tab == "ZIK":
+                            if self._media_music_sel == 3:
+                                # Écran lecture : haut/bas naviguent entre les boutons
+                                total = len(self._media_music_controls)
+                                if action == "haut":
+                                    self._media_music_control_idx = (self._media_music_control_idx + 1) % total
+                                else:
+                                    self._media_music_control_idx = (self._media_music_control_idx - 1) % total
+                                self._show_menu(self._menu_idx)
+                                return
+                            if self._media_music_results_menu:
+                                total = len(self._media_music_results)
+                                if total:
+                                    if action == "haut":
+                                        self._media_music_result_idx = (self._media_music_result_idx + 1) % total
+                                    else:
+                                        self._media_music_result_idx = (self._media_music_result_idx - 1) % total
+                                self._show_menu(self._menu_idx)
+                            elif self._media_music_playlist_menu:
+                                total = len(self._media_music_playlists)
+                                if total:
+                                    if action == "haut":
+                                        self._media_music_playlist_idx = (self._media_music_playlist_idx + 1) % total
+                                    else:
+                                        self._media_music_playlist_idx = (self._media_music_playlist_idx - 1) % total
+                                self._show_menu(self._menu_idx)
+                            elif self._media_music_recent_menu:
+                                total = len(self._media_music_recent)
+                                if total:
+                                    if action == "haut":
+                                        self._media_music_recent_idx = (self._media_music_recent_idx + 1) % total
+                                    else:
+                                        self._media_music_recent_idx = (self._media_music_recent_idx - 1) % total
+                                self._show_menu(self._menu_idx)
+                            else:
+                                opts = ["Rechercher", "Mes playlists", "Recent", "Lecture"]
+                                if action == "bas":
+                                    self._media_music_sel = (self._media_music_sel + 1) % len(opts)
+                                else:
+                                    self._media_music_sel = (self._media_music_sel - 1) % len(opts)
+                                self._show_menu(self._menu_idx)
+                elif self._menu_items[self._menu_idx] == "PARAMETRES":
+                    tabs = self._param_tabs
+                    cur_tab = tabs[self._param_submenu_idx % len(tabs)]
+                    if cur_tab == "SON" and self._param_son_adjusting and action in ("haut", "bas"):
+                        if action == "haut":
+                            self._volume_pct = max(0, self._volume_pct - 5)
+                        else:
+                            self._volume_pct = min(100, self._volume_pct + 5)
+                        self._radio_volume = int(127 * self._volume_pct / 100)
+                        os.popen(f"pactl set-sink-volume @DEFAULT_SINK@ {self._volume_pct}%")
+                        try:
+                            with open(self._volume_saved, "w") as fvol2:
+                                json.dump({"pct": self._volume_pct}, fvol2)
+                        except Exception as e:
+                            print(f"[VOL] save error: {e}")
+                        self._show_menu(self._menu_idx)
+                    elif cur_tab == "BT":
+                        if self._bt_submenu:
+                            if action in ("haut", "bas"):
+                                total = len(self._bt_devices)
+                                if total:
+                                    if action == "haut":
+                                        self._bt_selected_idx = (self._bt_selected_idx + 1) % total
+                                    else:
+                                        self._bt_selected_idx = (self._bt_selected_idx - 1) % total
+                                self._show_menu(self._menu_idx)
+                        elif self._bt_inside:
+                            if action in ("haut", "bas"):
+                                if action == "haut":
+                                    self._bt_idx = (self._bt_idx + 1) % 4
+                                else:
+                                    self._bt_idx = (self._bt_idx - 1) % 4
+                                self._show_menu(self._menu_idx)
+                        else:
+                            self._bt_inside = False
+                            if action == "haut":
+                                self._param_submenu_idx = (self._param_submenu_idx + 1) % len(tabs)
+                            else:
+                                self._param_submenu_idx = (self._param_submenu_idx - 1) % len(tabs)
+                            self._show_menu(self._menu_idx)
+                    elif cur_tab == "BOOT":
+                        if self._boot_submenu:
+                            if action in ("haut", "bas"):
+                                total = len(self._boot_options)
+                                if action == "haut":
+                                    self._boot_idx = (self._boot_idx + 1) % total
+                                else:
+                                    self._boot_idx = (self._boot_idx - 1) % total
+                                self._show_menu(self._menu_idx)
+                        else:
+                            if action == "haut":
+                                self._param_submenu_idx = (self._param_submenu_idx + 1) % len(tabs)
+                            else:
+                                self._param_submenu_idx = (self._param_submenu_idx - 1) % len(tabs)
+                            self._show_menu(self._menu_idx)
+                    elif action == "haut":
+                        self._param_son_adjusting = False
+                        self._bt_inside = False
+                        self._param_submenu_idx = (self._param_submenu_idx + 1) % len(tabs)
+                        self._show_menu(self._menu_idx)
+                    elif action == "bas":
+                        self._param_son_adjusting = False
+                        self._bt_inside = False
+                        self._param_submenu_idx = (self._param_submenu_idx - 1) % len(tabs)
+                        self._show_menu(self._menu_idx)
+                    elif action == "record":
+                        if cur_tab == "VIE":
+                            pass
+                        elif cur_tab == "BOOT":
+                            if not self._boot_submenu:
+                                self._boot_submenu = True
+                                self._show_menu(self._menu_idx)
+                            else:
+                                opt = self._boot_options[self._boot_idx % len(self._boot_options)]
+                                if opt == "REBOOT":
+                                    try:
+                                        subprocess.Popen(["sudo", "reboot"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        print("[PARAM] Executing reboot")
+                                    except Exception as e:
+                                        print(f"[PARAM] reboot error: {e}")
+                                elif opt == "ETEINDRE":
+                                    try:
+                                        subprocess.Popen(["sudo", "poweroff"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        print("[PARAM] Executing poweroff")
+                                    except Exception as e:
+                                        print(f"[PARAM] poweroff error: {e}")
+                                elif opt == "GATEWAY":
+                                    try:
+                                        subprocess.Popen(["pkill", "-f", "autossh.*toth_tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        import time
+                                        time.sleep(0.5)
+                                        subprocess.Popen([
+                                            "autossh", "-M", "0", "-N",
+                                            "-R", "2222:localhost:22",
+                                            "-i", "/home/pi/.ssh/toth_tunnel",
+                                            "-o", "ServerAliveInterval=30",
+                                            "-o", "ServerAliveCountMax=3",
+                                            "-o", "ExitOnForwardFailure=yes",
+                                            "root@49.13.237.85"
+                                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        print("[PARAM] Relance autossh")
+                                    except Exception as e:
+                                        print(f"[PARAM] gateway error: {e}")
+                                elif opt == "SERVICE":
+                                    try:
+                                        subprocess.Popen(["sudo", "systemctl", "restart", "toth.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                        print("[PARAM] Restart toth.service")
+                                    except Exception as e:
+                                        print(f"[PARAM] service error: {e}")
+                                self._boot_submenu = False
+                                self._show_menu(self._menu_idx)
+                        elif cur_tab == "BT":
+                            self._bt_handle_record()
+
+            elif action == "radio_toggle":
+                if self._menu_items[self._menu_idx] == "MEDIA":
+                    cur_tab = self._media_tabs[self._media_idx % len(self._media_tabs)]
+                    inside = getattr(self, '_media_inside', False)
+                    if inside and cur_tab == "RADIO":
+                        self._ring_radio_toggle()
+                    elif inside and cur_tab == "ZIK":
+                        import subprocess
+                        try:
+                            subprocess.run(["playerctl", "play-pause"], timeout=3)
+                        except Exception as e:
+                            print(f"[MUSIC] play-pause error: {e}")
+        except Exception as e:
+            print(f"[RING] Action error: {e}")
+
+    def _net_update_loop(self):
+        while True:
+            try:
+                self._net_hostname = subprocess.check_output(["hostname"]).decode().strip()
+            except: pass
+            try:
+                ips = subprocess.check_output(["hostname", "-I"]).decode().strip().split()
+                self._net_local_ip = ips[0] if ips else "?"
+            except: pass
+            try:
+                self._net_tailscale_ip = subprocess.check_output(["tailscale", "ip", "-4"]).decode().strip().split()[0]
+            except: pass
+            try:
+                ssid = subprocess.check_output(["iwgetid", "-r"]).decode().strip()
+                self._net_wifi_ssid = ssid if ssid else "?"
+            except: pass
+            try:
+                out = subprocess.check_output(["systemctl", "is-active", "tailscaled"]).decode().strip()
+                self._net_tailscale_on = (out == "active")
+            except Exception:
+                self._net_tailscale_on = False
+            time.sleep(10)
+
+
+    def _load_books(self):
+        # Discover JSON books in /home/pi/toth/books/
+        try:
+            files = [f for f in os.listdir(self._books_dir) if f.endswith(".json")]
+            self._books = []
+            for fn in sorted(files):
+                fp = os.path.join(self._books_dir, fn)
+                with open(fp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._books.append({
+                    "file": fn,
+                    "title": data.get("title", fn),
+                    "author": data.get("author", ""),
+                    "chapters": data.get("chapters", [])
+                })
+            print(f"[BOOKS] Loaded {len(self._books)} books")
+        except Exception as e:
+            print(f"[BOOKS] load error: {e}")
+        # Load saved position
+        try:
+            if os.path.exists(self._books_saved):
+                with open(self._books_saved, "r") as f:
+                    s = json.load(f)
+                self._book_idx = s.get("book_idx", 0)
+                self._book_chapter_idx = s.get("chapter_idx", 0)
+                self._book_char_pos = s.get("char_pos", 0)
+        except Exception:
+            pass
+
+    def _save_book_state(self):
+        try:
+            s = {"book_idx": self._book_idx, "chapter_idx": self._book_chapter_idx, "char_pos": self._book_char_pos}
+            with open(self._books_saved, "w") as f:
+                json.dump(s, f)
+        except Exception as e:
+            print(f"[BOOKS] save error: {e}")
+
+    def _book_get_current_text(self):
+        if not self._books or self._book_idx >= len(self._books):
+            return ""
+        book = self._books[self._book_idx]
+        chs = book["chapters"]
+        if self._book_chapter_idx >= len(chs):
+            return ""
+        text = chs[self._book_chapter_idx].get("text", "")
+        return text
+
+    def _book_next_chunk(self):
+        text = self._book_get_current_text()
+        if not text:
+            return ""
+        # Return chunk from current pos, ~400 chars
+        chunk = text[self._book_char_pos:self._book_char_pos + 400]
+        return chunk.strip()
+
+    def _book_advance(self, chars):
+        text = self._book_get_current_text()
+        self._book_char_pos = min(len(text), self._book_char_pos + chars)
+        self._save_book_state()
+
+    def _book_rewind_chapter(self):
+        self._book_char_pos = 0
+        self._save_book_state()
+
+    def _book_next_chapter(self):
+        if not self._books or self._book_idx >= len(self._books):
+            return
+        chs = self._books[self._book_idx]["chapters"]
+        if self._book_chapter_idx + 1 < len(chs):
+            self._book_chapter_idx += 1
+            self._book_char_pos = 0
+            self._save_book_state()
+
+    def _book_prev_chapter(self):
+        if self._book_chapter_idx > 0:
+            self._book_chapter_idx -= 1
+            self._book_char_pos = 0
+            self._save_book_state()
+
+    def _book_suggest(self):
+        import random
+        if not self._books or self._book_idx >= len(self._books):
+            return ""
+        chs = self._books[self._book_idx]["chapters"]
+        if not chs:
+            return ""
+        idx = random.randint(0, len(chs) - 1)
+        self._book_chapter_idx = idx
+        self._book_char_pos = 0
+        self._save_book_state()
+
+    def _book_speak_chunk(self):
+        """Toggle play/pause pour la lecture audio."""
+        if self._book_is_playing:
+            self._book_stop()
+            return
+        chunk = self._book_next_chunk()
+        if not chunk:
+            return
+        self._book_is_playing = True
+        self._book_last_text = chunk
+        try:
+            tmp_mp3 = "/tmp/toth_book.mp3"
+            tmp_wav = "/tmp/toth_book.wav"
+            from edge_tts import Communicate
+            import asyncio
+            async def synth():
+                com = Communicate(chunk, "fr-FR-DeniseNeural", rate="+0%", volume="+0%", pitch="+0Hz")
+                await com.save(tmp_mp3)
+            asyncio.run(synth())
+            subprocess.run(["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "22050", "-ac", "1", tmp_wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(tmp_wav) and self._book_is_playing:
+                self._book_proc = subprocess.Popen(["aplay", tmp_wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._book_proc.wait()
+                if self._book_is_playing:
+                    self._book_advance(len(chunk))
+        except Exception as e:
+            print(f"[BOOK TTS] error: {e}")
+        finally:
+            self._book_is_playing = False
+            self._book_proc = None
+
+    def _book_stop(self):
+        try:
+            if self._book_proc and self._book_proc.poll() is None:
+                self._book_proc.terminate()
+                try:
+                    self._book_proc.wait(timeout=0.5)
+                except Exception:
+                    self._book_proc.kill()
+        except Exception:
+            pass
+        self._book_is_playing = False
+        self._book_proc = None
+
+    def _play_wav_bytes(self, data):
+        """Play raw wav bytes via aplay if available, else speaker-test fallback."""
+        try:
+            # Write to temp file and play
+            wf = "/tmp/toth_play.wav"
+            with open(wf, "wb") as f:
+                f.write(data)
+            subprocess.run(["aplay", wf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        except Exception:
+            # Fallback: just log
+            pass
+    def _const_update_loop(self):
+        while True:
+            try:
+                mem = os.popen("free -m | grep Mem:").read().strip().split()
+                self._const_ram_total = mem[1]
+                self._const_ram_used = mem[3]
+            except: pass
+            try:
+                temp_raw = open("/sys/class/thermal/thermal_zone0/temp").read().strip()
+                self._const_temp = str(int(temp_raw) / 1000) + " C"
+            except: pass
+            try:
+                swap = os.popen("free -m | grep Swap:").read().strip().split()
+                self._const_swap_total = swap[1]
+                self._const_swap_used = swap[3]
+            except: pass
+            try:
+                self._const_load = os.popen("uptime").read().strip().split("load average: ")[-1]
+            except: pass
+            try:
+                disk_out = subprocess.check_output(["df", "-h", "/"]).decode().strip().splitlines()
+                parts = disk_out[1].split()
+                self._const_disk_used = parts[2]
+                self._const_disk_pct = parts[4]
+            except: pass
+            time.sleep(10)
+
+    def _bt_scan(self):
+        """Scan Bluetooth et met à jour _bt_devices."""
+        import subprocess
+        self._bt_scanning = True
+        self._show_menu(self._menu_idx)
+        try:
+            # Vider liste precedente
+            self._bt_devices = []
+            # Scan de 3 minutes avec hcitool
+            result = subprocess.run(
+                ["hcitool", "scan", "--flush"],
+                capture_output=True, text=True, timeout=15
+            )
+            for line in result.stdout.strip().split('\n'):
+                parts = line.strip().split()
+                if len(parts) >= 2 and ':' in parts[0]:
+                    mac = parts[0]
+                    name = ' '.join(parts[1:]) if len(parts) > 1 else '?'
+                    # Verifier si paired/connected via bluetoothctl
+                    paired = False
+                    connected = False
+                    try:
+                        info = subprocess.run(
+                            ["bluetoothctl", "info", mac],
+                            capture_output=True, text=True, timeout=3
+                        ).stdout
+                        paired = "Paired: yes" in info
+                        connected = "Connected: yes" in info
+                    except: pass
+                    self._bt_devices.append({
+                        "mac": mac, "name": name,
+                        "paired": paired, "connected": connected
+                    })
+        except Exception as e:
+            print(f"[BT] scan error: {e}")
+        finally:
+            self._bt_scanning = False
+            self._bt_last_scan = time.time()
+            self._show_menu(self._menu_idx)
+
+    def _bt_pair(self, mac):
+        """Appairer un peripherique avec PIN auto=0000."""
+        import subprocess, select, time
+        try:
+            subprocess.run(["bluetoothctl", "pairable", "on"], timeout=3)
+            subprocess.run(["bluetoothctl", "agent", "on"], timeout=3)
+            subprocess.run(["bluetoothctl", "default-agent"], timeout=3)
+            # Lancer pair en mode interactif pour capter le PIN
+            proc = subprocess.Popen(
+                ["bluetoothctl"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True, bufsize=1
+            )
+            def _send(cmd):
+                proc.stdin.write(cmd + "\n")
+                proc.stdin.flush()
+            _send(f"pair {mac}")
+            paired = False
+            start = time.time()
+            while time.time() - start < 20:
+                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                if ready:
+                    line = proc.stdout.readline()
+                    print(f"[BT] {line.strip()}")
+                    if "Passkey" in line or "PIN code" in line or "passkey" in line.lower():
+                        _send("0000")
+                        print("[BT] Sent PIN 0000")
+                    elif "Pairing successful" in line:
+                        paired = True
+                        break
+                    elif "Failed" in line or "ConnectionFailed" in line or "refused" in line.lower():
+                        break
+            _send("quit")
+            proc.wait(timeout=5)
+            if paired:
+                print(f"[BT] Paired {mac}")
+            return paired
+        except Exception as e:
+            print(f"[BT] pair error: {e}")
+            return False
+
+    def _bt_connect(self, mac):
+        """Connecter un peripherique paire."""
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["bluetoothctl", "connect", mac],
+                capture_output=True, text=True, timeout=10
+            )
+            if "Connection successful" in out.stdout or "Already connected" in out.stdout:
+                print("[BT] Connected " + mac)
+                # Switcher le son sur BT
+                try:
+                    bt_sink = subprocess.run(["pactl", "list", "sinks", "short"], capture_output=True, text=True, timeout=5).stdout
+                    for line in bt_sink.split(chr(10)):
+                        if "bluez" in line:
+                            sink_name = line.split()[1]
+                            subprocess.run(["pactl", "set-default-sink", sink_name], timeout=5)
+                            print("[BT] Audio sur " + sink_name)
+                            break
+                except Exception as e:
+                    print("[BT] Sink error: " + str(e))
+                return True
+            else:
+                print("[BT] Connect response: " + out.stdout)
+                return False
+        except Exception as e:
+            print("[BT] connect error: " + str(e))
+            return False
+
+    def _bt_disconnect(self, mac):
+        """Deconnecter un peripherique."""
+        import subprocess
+        try:
+            subprocess.run(["bluetoothctl", "disconnect", mac], timeout=5)
+            print(f"[BT] Disconnected {mac}")
+            return True
+        except Exception as e:
+            print(f"[BT] disconnect error: {e}")
+            return False
+
+    def _bt_remove(self, mac):
+        """Supprimer un peripherique appaire."""
+        import subprocess
+        try:
+            subprocess.run(["bluetoothctl", "remove", mac], timeout=5)
+            print(f"[BT] Removed {mac}")
+            return True
+        except Exception as e:
+            print(f"[BT] remove error: {e}")
+            return False
+
+    def _missive_handle_record(self):
+        """Gerer bouton milieu dans MISSIVE."""
+        if self._missive_state == "idle":
+            # Demarrer enregistrement
+            self._missive_state = "recording"
+            self._missive_preview = ""
+            self._show_menu(self._menu_idx)
+            threading.Thread(target=self._missive_record_task, daemon=True).start()
+        elif self._missive_state == "recording":
+            # Stop recording, passer en preview
+            self._missive_state = "preview"
+            self._show_menu(self._menu_idx)
+        elif self._missive_state == "preview":
+            text = self._missive_preview.strip()
+            if text:
+                self._missive_state = "confirm"
+                self._show_menu(self._menu_idx)
+            else:
+                self._missive_state = "idle"
+                self._missive_preview = ""
+                self._show_menu(self._menu_idx)
+        elif self._missive_state == "confirm":
+            text = self._missive_preview.strip()
+            if text:
+                self._missive_history.append({"role": "user", "text": text})
+                self._missive_state = "sending"
+                self._show_menu(self._menu_idx)
+                threading.Thread(target=self._missive_send_to_hermes, args=(text,), daemon=True).start()
+            else:
+                self._missive_state = "idle"
+                self._missive_preview = ""
+                self._show_menu(self._menu_idx)
+
+    def _missive_record_task(self):
+        """Enregistre audio et transcrit quand stop demande."""
+        import subprocess, tempfile, os, requests
+        try:
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            os.close(fd)
+            # Enregistrement continu jusqu'a _missive_state != "recording"
+            proc = subprocess.Popen(
+                ["arecord", "-D", "plughw:1,0", "-f", "S16_LE", "-r", "16000", "-c", "1", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while proc.poll() is None and self._missive_state == "recording":
+                time.sleep(0.2)
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except:
+                proc.kill()
+            # Si on est en preview, transcrire
+            if self._missive_state == "preview" and os.path.getsize(path) > 1000:
+                # Transcription via Whisper (Groq)
+                try:
+                    with open(path, "rb") as af:
+                        resp = requests.post(
+                            "https://api.groq.com/openai/v1/audio/transcriptions",
+                            headers={"Authorization": "Bearer " + os.environ.get("GROQ_KEY", "")},
+                            files={"file": ("audio.wav", af, "audio/wav")},
+                            data={"model": "whisper-large-v3", "language": "fr", "response_format": "json", "prompt": _WHISPER_PROMPT, "temperature": "0.0"},
+                            timeout=10)
+                    if resp.status_code == 200:
+                        self._missive_preview = resp.json().get("text", "?")
+                    else:
+                        self._missive_preview = f"Err {resp.status_code}"
+                except Exception as e:
+                    self._missive_preview = f"Err: {e}"
+                self._show_menu(self._menu_idx)
+        finally:
+            try:
+                os.unlink(path)
+            except: pass
+
+    def _missive_send_to_hermes(self, text):
+        """Envoie message a Hermes, recupere reponse TTS locale."""
+        import requests
+        try:
+            payload = {"message": text, "session_id": self._session_id if hasattr(self, '_session_id') else "toth"}
+            resp = requests.post(
+                "https://toth-bridge.example/chat",  # Placeholder — adapte selon ton endpoint
+                json=payload, timeout=30)
+            reply = resp.json().get("reply", "...")
+            self._missive_history.append({"role": "v4", "text": reply})
+            # Reponse TTS locale via edge-tts
+            threading.Thread(target=self._missive_tts, args=(reply,), daemon=True).start()
+        except Exception as e:
+            self._missive_history.append({"role": "v4", "text": f"Erreur: {e}"})
+        finally:
+            self._missive_state = "idle"
+            self._missive_preview = ""
+            self._show_menu(self._menu_idx)
+
+    def _missive_tts(self, text):
+        """Joue reponse TTS localement."""
+        import subprocess, tempfile, os
+        try:
+            fd, mp3 = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            # Generer TTS avec edge-tts
+            subprocess.run(
+                ["edge-tts", "--text", text[:200], "--write-media", mp3],
+                timeout=15)
+            if os.path.exists(mp3) and os.path.getsize(mp3) > 100:
+                subprocess.run(["ffplay", "-nodisp", "-autoexit", mp3], timeout=60)
+        except Exception as e:
+            print(f"[MISSIVE] TTS error: {e}")
+        finally:
+            try: os.unlink(mp3)
+            except: pass
+
+    def _bt_handle_record(self):
+        """Gerer bouton milieu dans BT — entrée puis options."""
+        if not self._bt_inside:
+            # Premier tap sur onglet BT : entrer dans les options
+            self._bt_inside = True
+            self._bt_idx = 0
+            self._show_menu(self._menu_idx)
+            return
+        if self._bt_submenu:
+            devs = self._bt_devices
+            if not devs:
+                self._disp("Aucun appareil")
+                return
+            cur = devs[self._bt_selected_idx % len(devs)]
+            mac = cur["mac"]
+            if cur.get("connected"):
+                self._bt_disconnect(mac)
+            elif cur.get("paired"):
+                self._bt_connect(mac)
+            else:
+                self._disp("PAIRING...\n" + cur.get("name","?")[:15])
+                ok = self._bt_pair(mac)
+                if ok:
+                    self._disp("PAIRED\nCONNECTING...")
+                    time.sleep(0.5)
+                    self._bt_connect(mac)
+                else:
+                    self._disp("REFUSED\n" + cur.get("name","?")[:15])
+                    threading.Timer(2.0, lambda: self._show_menu(self._menu_idx)).start()
+            return
+        # _bt_inside = True, pas _bt_submenu → exécuter option sélectionnée
+        opt = ["APPAREILS", "SCANNER", "BT ON", "BT OFF"][self._bt_idx % 4]
+        if opt == "APPAREILS":
+            self._bt_submenu = True
+            self._bt_scanning = False
+            try:
+                out = subprocess.check_output(["bluetoothctl", "devices"], text=True, timeout=5)
+                self._bt_devices = []
+                for line in out.strip().split(chr(10)):
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[0] == "Device":
+                        self._bt_devices.append({
+                            "mac": parts[1],
+                            "name": " ".join(parts[2:]) if len(parts) > 2 else "?",
+                            "paired": True
+                        })
+                print("[BT] " + str(len(self._bt_devices)) + " paires")
+            except Exception as e:
+                print("[BT] Paire err: " + str(e))
+            self._show_menu(self._menu_idx)
+        elif opt == "SCANNER":
+            self._bt_submenu = True
+            self._bt_scanning = True
+            self._bt_devices = []
+            self._bt_selected_idx = 0
+            threading.Thread(target=self._bt_scan, daemon=True).start()
+        elif opt == "BT ON":
+            subprocess.run(["bluetoothctl", "power", "on"], timeout=5)
+            print("[BT] Power ON")
+            self._show_menu(self._menu_idx)
+        elif opt == "BT OFF":
+            subprocess.run(["bluetoothctl", "power", "off"], timeout=5)
+            print("[BT] Power OFF")
+            self._show_menu(self._menu_idx)
+
+    def _param_handle_record(self):
+        cur_tab = self._param_tabs[self._param_submenu_idx % len(self._param_tabs)]
+        if cur_tab == "SON":
+            self._param_son_adjusting = not self._param_son_adjusting
+            self._show_menu(self._menu_idx)
+        elif cur_tab == "BOOT":
+            if not self._boot_submenu:
+                self._boot_submenu = True
+                self._show_menu(self._menu_idx)
+            else:
+                opt = self._boot_options[self._boot_idx % len(self._boot_options)]
+                if opt == "REBOOT":
+                    try:
+                        subprocess.Popen(["sudo", "reboot"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print("[PARAM] Executing reboot")
+                    except Exception as e:
+                        print(f"[PARAM] reboot error: {e}")
+                elif opt == "ETEINDRE":
+                    try:
+                        subprocess.Popen(["sudo", "poweroff"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print("[PARAM] Executing poweroff")
+                    except Exception as e:
+                        print(f"[PARAM] poweroff error: {e}")
+                elif opt == "GATEWAY":
+                    try:
+                        subprocess.Popen(["pkill", "-f", "autossh.*toth_tunnel"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        import time
+                        time.sleep(0.5)
+                        subprocess.Popen([
+                            "autossh", "-M", "0", "-N",
+                            "-R", "2222:localhost:22",
+                            "-i", "/home/pi/.ssh/toth_tunnel",
+                            "-o", "ServerAliveInterval=30",
+                            "-o", "ServerAliveCountMax=3",
+                            "-o", "ExitOnForwardFailure=yes",
+                            "root@49.13.237.85"
+                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print("[PARAM] Relance autossh")
+                    except Exception as e:
+                        print(f"[PARAM] gateway error: {e}")
+                elif opt == "SERVICE":
+                    try:
+                        subprocess.Popen(["sudo", "systemctl", "restart", "toth.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        print("[PARAM] Restart toth.service")
+                    except Exception as e:
+                        print(f"[PARAM] service error: {e}")
+                self._boot_submenu = False
+                self._show_menu(self._menu_idx)
+        elif cur_tab == "OFF":
+            try:
+                subprocess.Popen(["sudo", "poweroff"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("[PARAM] Executing poweroff")
+            except Exception as e:
+                print(f"[PARAM] poweroff error: {e}")
+        elif cur_tab == "VIE":
+            self._param_vie_confirm = True
+            self._show_menu(self._menu_idx)
+            threading.Timer(0.5, lambda: setattr(self, '_param_vie_confirm', False) or self._show_menu(self._menu_idx)).start()
+        elif cur_tab == "SSH":
+            try:
+                os.popen("pkill -f 'autossh.*toth_tunnel'")
+                time.sleep(0.5)
+                subprocess.Popen([
+                    "autossh", "-M", "0", "-N",
+                    "-R", "2222:localhost:22",
+                    "-i", "/home/pi/.ssh/toth_tunnel",
+                    "-o", "ServerAliveInterval=30",
+                    "-o", "ServerAliveCountMax=3",
+                    "-o", "ExitOnForwardFailure=yes",
+                    "root@49.13.237.85"
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("[SSH] Relance autossh")
+            except Exception as e:
+                print(f"[SSH] Error: {e}")
+            self._param_tunnel_confirm = True
+            self._show_menu(self._menu_idx)
+            threading.Timer(0.5, lambda: setattr(self, '_param_tunnel_confirm', False) or self._show_menu(self._menu_idx)).start()
+        elif cur_tab == "NET":
+            self._net_tailscale_on = not self._net_tailscale_on
+            try:
+                if self._net_tailscale_on:
+                    subprocess.run(["sudo", "systemctl", "start", "tailscaled"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                else:
+                    subprocess.run(["sudo", "systemctl", "stop", "tailscaled"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception as e:
+                print(f"[NET] tailscale toggle error: {e}")
+            self._show_menu(self._menu_idx)
+        elif cur_tab == "BT":
+            self._bt_handle_record()
+
+    # ── Radio via mpg123 ──────────────────────────────────────────────
+    def _ring_radio_stations(self):
+        """Return ordered list of station URLs (same stations as radio.py)."""
+        import radio as radio_mod
+        return list(radio_mod.RADIOS.values())  # [(name, url), ...]
+
+    def _ring_radio_play(self):
+        """Start mpg123 on the current station."""
+        with self._radio_fade_lock:
+            stations = self._ring_radio_stations()
+            if not stations:
+                return
+            idx = self._radio_station_idx % len(stations)
+            name, url = stations[idx]
+            print(f"[RADIO] ▶ {name}")
+            try:
+                if self._radio_proc:
+                    self._radio_proc.kill()
+                    self._radio_proc = None
+                self._radio_proc = subprocess.Popen(
+                    ["ffmpeg", "-i", url, "-ar", "48000", "-ac", "2", "-f", "alsa", "default", "-nostdin", "-loglevel", "error"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                self._radio_playing = True
+            except Exception as e:
+                print(f"[RADIO] Play error: {e}")
+
+    def _ring_radio_stop(self):
+        """Stop radio playback."""
+        with self._radio_fade_lock:
+            if self._radio_proc:
+                self._radio_proc.kill()
+                self._radio_proc = None
+            self._radio_playing = False
+
+    def _ring_radio_toggle(self):
+        """Toggle radio on/off."""
+        if self._radio_playing:
+            self._ring_radio_stop()
+        else:
+            self._ring_radio_play()
+
+    def _ring_radio_next(self):
+        """Switch to next station."""
+        self._radio_station_idx = (self._radio_station_idx + 1) % len(self._ring_radio_stations())
+        if self._radio_playing:
+            self._ring_radio_play()
+        else:
+            name, _ = self._ring_radio_stations()[self._radio_station_idx]
+            print(f"[RADIO] Selected: {name} (radio off)")
+
+    def _ring_radio_prev(self):
+        """Switch to previous station."""
+        total = len(self._ring_radio_stations())
+        self._radio_station_idx = (self._radio_station_idx - 1) % total
+        if self._radio_playing:
+            self._ring_radio_play()
+        else:
+            name, _ = self._ring_radio_stations()[self._radio_station_idx]
+            print(f"[RADIO] Selected: {name} (radio off)")
+
+    def _ring_radio_volume(self, direction):
+        """Adjust radio volume via amixer Speaker. direction='up' or 'down'."""
+        step = 5   # 5 = ~4% of 127
+        new = self._radio_volume + step if direction == "up" else self._radio_volume - step
+        new = max(0, min(127, new))
+        if new != self._radio_volume:
+            self._radio_volume = new
+            try:
+                subprocess.run(
+                    ["amixer", "-c", "0", "set", "Master", str(new)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                pct = (new * 100) // 127
+                print(f"[RADIO] 🔈 Volume {pct}%")
+            except Exception as e:
+                print(f"[RADIO] Volume error: {e}")
+
+    def run(self):
+        print("[TOTH] Started (Hermes direct mode).")
+        # Règle 2 (auto-réparation) : heartbeat toutes les 5s
+        heartbeat_path = "/tmp/toth_heartbeat"
+        try:
+            while True:
+                try:
+                    with open(heartbeat_path, "w") as f:
+                        f.write(str(time.time()))
+                except Exception:
+                    pass
+                time.sleep(POLL_INT)
+        except KeyboardInterrupt:
+            print("[TOTH] Shutdown.")
+        finally:
+            try: os.remove(heartbeat_path)
+            except Exception: pass
+            self._down()
+
+    def _down(self):
+        self._rgb(0, 0, 0)
+        if self.rec:
+            try: self.rec.stop()
+            except Exception: pass
+        if self.board:
+            try: self.board.cleanup()
+            except Exception: pass
+
+if __name__ == "__main__":
+    if not O_K:
+        print("ERROR: no ollama_api_key in config.json"); sys.exit(1)
+    TothChatbot().run()
